@@ -183,3 +183,13 @@ float32 speed 0
 float32 acceleration (duty)
 float32 jerk 3
 ```
+
+## 100 Hz vehicle profile
+
+The driver polls `sensors/core` (ERPM, motor/input current, voltage and fault data) and `sensors/imu` / `sensors/imu/raw` at 100 Hz by default. `telemetry_rate_hz` is a startup parameter in the range 1–1000 Hz; the maximum supported rate depends on the link and controller. `baud_rate` defaults to 921600 with no hardware flow control. USB CDC transport does not gain UART bandwidth from this baud setting.
+
+Motor and servo commands are forwarded immediately on each received ROS command. For 100 Hz command transmission, configure the upstream selector/publisher to 100 Hz, as AIMSRacer's vehicle launch does. This repeats the latest selected command; it does not increase the upstream planner's production of new commands. Core-driven wheel odometry follows the telemetry rate.
+
+The receive thread processes incoming bytes immediately without the former 5 ms sleep. Transmits keep packet storage alive and serialize complete frames, including partial writes.
+
+With the ROS workspace built and sourced, run `python3 -m pytest -q vesc_driver/test/test_driver_link.py`. This test uses a PTY VESC and an isolated ROS domain to check 50/100 Hz telemetry, 100 Hz motor/servo frames, ERPM/current decoding, fragmented replies and CRC integrity without opening vehicle devices.

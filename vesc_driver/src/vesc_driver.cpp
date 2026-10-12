@@ -36,6 +36,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -67,10 +68,17 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
 {
   // get vesc serial port address
   std::string port = declare_parameter<std::string>("port", "");
+  const auto baud_rate = declare_parameter<int>("baud_rate", 921600);
+  const auto telemetry_rate = declare_parameter<double>("telemetry_rate_hz", 100.0);
+  if (baud_rate <= 0 || baud_rate > std::numeric_limits<int>::max() ||
+    !std::isfinite(telemetry_rate) || telemetry_rate < 1.0 || telemetry_rate > 1000.0)
+  {
+    throw std::invalid_argument("baud_rate must be positive; telemetry_rate_hz must be in [1, 1000]");
+  }
 
   // attempt to connect to the serial port
   try {
-    vesc_.connect(port);
+    vesc_.connect(port, static_cast<uint32_t>(baud_rate));
   } catch (SerialException e) {
     RCLCPP_FATAL(get_logger(), "Failed to connect to the VESC, %s.", e.what());
     rclcpp::shutdown();
@@ -103,8 +111,13 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   servo_sub_ = create_subscription<Float64>(
     "commands/servo/position", rclcpp::QoS{10}, std::bind(&VescDriver::servoCallback, this, _1));
 
-  // create a 50Hz timer, used for state machine & polling VESC telemetry
-  timer_ = create_wall_timer(20ms, std::bind(&VescDriver::timerCallback, this));
+  // Poll core and IMU once per tick; commands are forwarded immediately on receipt.
+  const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double>(1.0 / telemetry_rate));
+  timer_ = create_wall_timer(period, std::bind(&VescDriver::timerCallback, this));
+  RCLCPP_INFO(
+    get_logger(), "VESC port %s, baud %d, core/IMU polling %.1f Hz",
+    port.c_str(), static_cast<int>(baud_rate), telemetry_rate);
 }
 
 /* TODO or TO-THINKABOUT LIST
@@ -140,7 +153,7 @@ void VescDriver::timerCallback()
     if (fw_version_major_ >= 0 && fw_version_minor_ >= 0) {
       RCLCPP_INFO(
         get_logger(), "Connected to VESC with firmware version %d.%d",
-        fw_version_major_, fw_version_minor_);
+        fw_version_major_.load(), fw_version_minor_.load());
       driver_mode_ = MODE_OPERATING;
     }
   } else if (driver_mode_ == MODE_OPERATING) {

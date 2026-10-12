@@ -10,6 +10,8 @@
     steering_angle_to_servo_offset: 0.444
 
     port: '/dev/ttyVESC'
+    baud_rate: 921600
+    telemetry_rate_hz: 100.0
     duty_cycle_min: -0.8
     duty_cycle_max: 0.8
     current_min: -150.0

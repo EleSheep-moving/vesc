@@ -31,6 +31,7 @@
 #include "vesc_driver/vesc_interface.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <iomanip>
 #include <iostream>
@@ -56,9 +57,10 @@ public:
   {}
   void packet_creation_thread();
   void on_configure();
-  void connect(const std::string & port);
+  void connect(const std::string & port, uint32_t baud_rate);
 
-  bool packet_thread_run_;
+  std::atomic<bool> packet_thread_run_{false};
+  std::mutex send_mutex_;
   std::unique_ptr<std::thread> packet_thread_;
   PacketHandlerFunction packet_handler_;
   ErrorHandlerFunction error_handler_;
@@ -139,15 +141,13 @@ void VescInterface::Impl::packet_creation_thread()
       }
       buffer_.erase(buffer_.begin(), iter);
     }
-    // Only attempt to read every 5 ms
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // receive() blocks until bytes arrive; process them without an added polling delay.
   }
 }
 
-void VescInterface::Impl::connect(const std::string & port)
+void VescInterface::Impl::connect(const std::string & port, uint32_t baud_rate)
 {
-  uint32_t baud_rate = 115200;
-  auto fc = drivers::serial_driver::FlowControl::HARDWARE;
+  auto fc = drivers::serial_driver::FlowControl::NONE;
   auto pt = drivers::serial_driver::Parity::NONE;
   auto sb = drivers::serial_driver::StopBits::ONE;
   device_config_ =
@@ -189,7 +189,7 @@ void VescInterface::setErrorHandler(const ErrorHandlerFunction & handler)
   impl_->error_handler_ = handler;
 }
 
-void VescInterface::connect(const std::string & port)
+void VescInterface::connect(const std::string & port, uint32_t baud_rate)
 {
   // todo - mutex?
 
@@ -199,7 +199,7 @@ void VescInterface::connect(const std::string & port)
 
   // connect to serial port
   try {
-    impl_->connect(port);
+    impl_->connect(port, baud_rate);
   } catch (const std::exception & e) {
     std::stringstream ss;
     ss << "Failed to open the serial port " << port << " to the VESC. " << e.what();
@@ -238,7 +238,17 @@ bool VescInterface::isConnected() const
 
 void VescInterface::send(const VescPacket & packet)
 {
-  impl_->serial_driver_->port()->async_send(packet.frame());
+  // Keep the frame alive until every byte is written. async_send() borrows its input,
+  // while the request helpers pass temporary packets. Serialize complete frames too.
+  std::lock_guard<std::mutex> lock(impl_->send_mutex_);
+  auto remaining = packet.frame();
+  while (!remaining.empty()) {
+    const auto written = impl_->serial_driver_->port()->send(remaining);
+    if (written == 0) {
+      throw SerialException("Serial write made no progress");
+    }
+    remaining.erase(remaining.begin(), remaining.begin() + written);
+  }
 }
 
 void VescInterface::requestFWVersion()

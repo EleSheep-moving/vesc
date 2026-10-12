@@ -31,6 +31,7 @@
 #ifndef VESC_DRIVER__VESC_DRIVER_HPP_
 #define VESC_DRIVER__VESC_DRIVER_HPP_
 
+#include <atomic>
 #include <experimental/optional>
 #include <memory>
 #include <string>
@@ -114,9 +115,9 @@ private:
   driver_mode_t;
 
   // other variables
-  driver_mode_t driver_mode_;           ///< driver state machine mode (state)
-  int fw_version_major_;                ///< firmware major version reported by vesc
-  int fw_version_minor_;                ///< firmware minor version reported by vesc
+  std::atomic<driver_mode_t> driver_mode_;  ///< shared with the serial receive thread
+  std::atomic<int> fw_version_major_;
+  std::atomic<int> fw_version_minor_;
 
   // ROS callbacks
   void brakeCallback(const Float64::SharedPtr brake);

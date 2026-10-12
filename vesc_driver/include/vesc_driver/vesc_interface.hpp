@@ -33,6 +33,7 @@
 
 #include "vesc_driver/vesc_packet.hpp"
 
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -95,7 +96,7 @@ public:
    *
    * @throw SerialException
    */
-  void connect(const std::string & port);
+  void connect(const std::string & port, uint32_t baud_rate = 921600);
 
   /**
    * Closes the serial port interface to the VESC.

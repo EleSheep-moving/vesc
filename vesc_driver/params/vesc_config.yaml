@@ -1,6 +1,8 @@
 /**:
   ros__parameters:
     port: "/dev/ttyVESC"
+    baud_rate: 921600
+    telemetry_rate_hz: 100.0
     # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
     speed_to_erpm_gain: 4614.0
     speed_to_erpm_offset: 0.0
