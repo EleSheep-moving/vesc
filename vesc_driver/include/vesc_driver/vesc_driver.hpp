@@ -32,6 +32,8 @@
 #define VESC_DRIVER__VESC_DRIVER_HPP_
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <experimental/optional>
 #include <memory>
 #include <string>
@@ -39,6 +41,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <vesc_msgs/msg/vesc_command.hpp>
 #include <vesc_msgs/msg/vesc_state.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
 #include <vesc_msgs/msg/vesc_imu.hpp>
@@ -61,6 +64,7 @@ class VescDriver
 {
 public:
   explicit VescDriver(const rclcpp::NodeOptions & options);
+  ~VescDriver() override;
 
 private:
   // interface to the VESC
@@ -89,12 +93,16 @@ private:
   CommandLimit current_limit_;
   CommandLimit brake_limit_;
   CommandLimit speed_limit_;
-  CommandLimit position_limit_;
   CommandLimit servo_limit_;
   bool command_watchdog_enabled_;
   double command_timeout_sec_;
   double command_max_age_sec_;
-  double watchdog_safe_erpm_;
+  double speed_gain_, speed_offset_, steering_gain_, steering_offset_;
+  bool current_startup_enabled_;
+  double startup_current_, startup_motion_sec_;
+  std::mutex motion_mutex_;
+  std::chrono::steady_clock::time_point motion_started_{}, last_telemetry_{};
+  bool motion_detected_{false};
 
   // ROS services
   rclcpp::Publisher<VescStateStamped>::SharedPtr state_pub_;
@@ -102,12 +110,7 @@ private:
   rclcpp::Publisher<Imu>::SharedPtr imu_std_pub_;
 
   rclcpp::Publisher<Float64>::SharedPtr servo_sensor_pub_;
-  rclcpp::SubscriptionBase::SharedPtr duty_cycle_sub_;
-  rclcpp::SubscriptionBase::SharedPtr current_sub_;
-  rclcpp::SubscriptionBase::SharedPtr brake_sub_;
-  rclcpp::SubscriptionBase::SharedPtr speed_sub_;
-  rclcpp::SubscriptionBase::SharedPtr position_sub_;
-  rclcpp::SubscriptionBase::SharedPtr servo_sub_;
+  rclcpp::Subscription<vesc_msgs::msg::VescCommand>::SharedPtr command_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   // driver modes (possible states)
@@ -122,25 +125,16 @@ private:
   std::atomic<driver_mode_t> driver_mode_;  ///< shared with the serial receive thread
   std::atomic<int> fw_version_major_;
   std::atomic<int> fw_version_minor_;
-  rclcpp::Time last_motor_command_time_;
+  std::chrono::steady_clock::time_point last_motor_command_time_;
   bool has_received_motor_command_;
   bool command_watchdog_active_;
 
   // ROS callbacks
-  void brakeCallback(
-    const Float64::SharedPtr brake, const rclcpp::MessageInfo & info);
-  void currentCallback(
-    const Float64::SharedPtr current, const rclcpp::MessageInfo & info);
-  void dutyCycleCallback(
-    const Float64::SharedPtr duty_cycle, const rclcpp::MessageInfo & info);
-  void positionCallback(
-    const Float64::SharedPtr position, const rclcpp::MessageInfo & info);
-  void servoCallback(
-    const Float64::SharedPtr servo, const rclcpp::MessageInfo & info);
-  void speedCallback(
-    const Float64::SharedPtr speed, const rclcpp::MessageInfo & info);
+  void commandCallback(
+    const vesc_msgs::msg::VescCommand::SharedPtr command, const rclcpp::MessageInfo & info);
   void timerCallback();
-  bool isCommandFresh(const rclcpp::MessageInfo & info) const;
+  bool isCommandFresh(const vesc_msgs::msg::VescCommand & command,
+    const rclcpp::MessageInfo & info) const;
   void markMotorCommandReceived();
   void checkCommandWatchdog();
 };

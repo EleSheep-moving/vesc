@@ -4,7 +4,7 @@
   <name>vesc_ackermann</name>
   <version>1.1.0</version>
   <description>
-    Translate between VESC messages and ROS ackermann and odometry messages.
+    Convert VESC telemetry and servo command echo to wheel odometry.
   </description>
   <maintainer email="joebetz@seas.upenn.edu">Johannes Betz</maintainer>
   <license>BSD</license>
@@ -16,7 +16,6 @@
 
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
-  <depend>ackermann_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rclcpp</depend>

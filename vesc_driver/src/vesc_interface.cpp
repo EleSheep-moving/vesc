@@ -238,10 +238,24 @@ bool VescInterface::isConnected() const
 
 void VescInterface::send(const VescPacket & packet)
 {
+  sendFrames(packet, nullptr);
+}
+
+void VescInterface::sendMotorAndServo(const VescPacket & motor, const VescPacket & servo)
+{
+  sendFrames(motor, &servo);
+}
+
+void VescInterface::sendFrames(const VescPacket & packet, const VescPacket * second)
+{
   // Keep the frame alive until every byte is written. async_send() borrows its input,
   // while the request helpers pass temporary packets. Serialize complete frames too.
   std::lock_guard<std::mutex> lock(impl_->send_mutex_);
   auto remaining = packet.frame();
+  if (second) {
+    const auto frame = second->frame();
+    remaining.insert(remaining.end(), frame.begin(), frame.end());
+  }
   while (!remaining.empty()) {
     const auto written = impl_->serial_driver_->port()->send(remaining);
     if (written == 0) {

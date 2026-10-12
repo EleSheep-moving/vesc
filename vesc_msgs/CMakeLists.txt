@@ -5,6 +5,7 @@ find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
 rosidl_generate_interfaces(vesc_msgs
+  "msg/VescCommand.msg"
   "msg/VescState.msg"
   "msg/VescStateStamped.msg"
   "msg/VescImu.msg"
@@ -20,4 +21,6 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
+ament_export_include_directories(include/${PROJECT_NAME})
 ament_auto_package()

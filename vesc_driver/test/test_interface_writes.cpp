@@ -34,6 +34,7 @@ TEST(InterfaceWrites, ConcurrentTemporaryPacketsRemainComplete)
   std::atomic<int> invalid{0}, speed_count{0}, servo_count{0}, send_errors{0};
   std::thread controller([&]() {
     std::vector<uint8_t> bytes;
+    bool awaiting_servo = false;
     while (running) {
       pollfd event{master, POLLIN, 0};
       if (poll(&event, 1, 10) <= 0) {
@@ -60,8 +61,12 @@ TEST(InterfaceWrites, ConcurrentTemporaryPacketsRemainComplete)
         if (bytes[n + 4] != 3 || crc != crc16(payload)) {
           ++invalid;
         } else if (payload[0] == 8 && n == 5) {
+          if (awaiting_servo) {++invalid;}
+          awaiting_servo = true;
           ++speed_count;
         } else if (payload[0] == 12 && n == 3) {
+          if (!awaiting_servo) {++invalid;}
+          awaiting_servo = false;
           ++servo_count;
         } else if (payload[0] == 0) {
           // Answer the shutdown wake-up request so the receive thread can exit.
@@ -92,11 +97,9 @@ TEST(InterfaceWrites, ConcurrentTemporaryPacketsRemainComplete)
       writers.emplace_back([&, worker]() {
         try {
           for (int i = 0; i < 500; ++i) {
-            if (worker % 2 == 0) {
-              interface.setSpeed(1000 + worker * 500 + i);
-            } else {
-              interface.setServo(.5);
-            }
+            interface.sendMotorAndServo(
+              vesc_driver::VescPacketSetRPM(1000 + worker * 500 + i),
+              vesc_driver::VescPacketSetServoPos(.5));
           }
         } catch (...) {
           ++send_errors;
@@ -107,12 +110,12 @@ TEST(InterfaceWrites, ConcurrentTemporaryPacketsRemainComplete)
       writer.join();
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (speed_count + servo_count < 2000 && std::chrono::steady_clock::now() < deadline) {
+    while (speed_count + servo_count < 4000 && std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_EQ(send_errors, 0);
-    EXPECT_EQ(speed_count, 1000);
-    EXPECT_EQ(servo_count, 1000);
+    EXPECT_EQ(speed_count, 2000);
+    EXPECT_EQ(servo_count, 2000);
     EXPECT_EQ(invalid, 0);
   }
   running = false;

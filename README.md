@@ -6,7 +6,36 @@ Packages to interface with Veddar VESC motor controllers. See https://vesc-proje
 
 This is a ROS2 implementation of the ROS1 driver using the new serial driver located in [transport drivers](https://github.com/ros-drivers/transport_drivers).
 
-## How to test
+## Vehicle command API
+
+The driver subscribes directly to `/vesc/command` (`vesc_msgs/msg/VescCommand`).
+Speed is m/s and steering is radians; conversion to electrical RPM/servo units is
+owned by the driver. Only the selected mode's target may be nonzero, all fields
+must be finite, and header.frame_id must be `base_link`. Stamp commands using the
+publisher's current ROS clock.
+
+Modes: SPEED=0, CURRENT=1, DUTY=2, BRAKE_CURRENT=3, ACCELERATION=4. Acceleration
+is reserved and always rejected, including zero requests. Nonzero braking is
+disabled by default (`brake_max=0`). The old Float64 actuation subscriptions and
+`ackermann_to_vesc_node` are removed. `vesc_ackermann` retains wheel odometry and
+its configurable longitudinal velocity variance (default 0.04).
+
+Reliable KeepLast(1), 100 ms lifespan, header/DDS source age checks and a steady
+100 ms command watchdog prevent stale commands from extending actuation. Invalid
+commands and watchdogs send literal zero ERPM and retain the last servo position.
+Motor/servo pairs share a blocking serial write mutex; telemetry still polls core
+and IMU at 100 Hz with 921600 baud. Zero speed bypasses conversion offsets.
+
+Current startup assistance is retained by default: signed 40 A until fresh
+absolute ERPM > 1 is confirmed for 100 ms; targets below 0.1 A send zero. Current
+limits still apply. Set `current_startup_enabled=false` to use direct current.
+The message carries requested current; the startup serial target can differ.
+
+Software tests use virtual PTYs only (`driver_link`, `interface_writes`,
+`vehicle_extensions`). They never open a physical VESC device. Hardware tests
+require the vehicle owner's explicit on-site instruction.
+
+## Hardware setup (only under owner direction)
 
 1. Clone this repository and [transport drivers](https://github.com/ros-drivers/transport_drivers) into `src`.
 2. `rosdep update && rosdep install --from-paths src -i -y`
@@ -153,36 +182,10 @@ If you want to compare ONLY the integration scheme:
 2) Make yaw wrapping consistent (add to v1 or remove from v2).
 3) Test with constant v, constant steering, constant dt and
 
-### update duty, current control mode
-```
-Speed+steer
-float32 steering_angle
-float32 steering_angle_velocity 0
-float32 speed
-float32 acceleration 0
-float32 jerk 0
+### Native message
 
-speed+acc(forward)+steer （nav only）
-float32 steering_angle
-float32 steering_angle_velocity 0
-float32 speed
-float32 acceleration 
-float32 jerk 1
-
-current+steer
-float32 steering_angle
-float32 steering_angle_velocity 0
-float32 speed 0
-float32 acceleration (current)
-float32 jerk 2
-
-duty+steer
-float32 steering_angle
-float32 steering_angle_velocity 0
-float32 speed 0
-float32 acceleration (duty)
-float32 jerk 3
-```
+See [VescCommand.msg](vesc_msgs/msg/VescCommand.msg) for the complete schema.
+Mode-specific targets replace the historical Ackermann `jerk`/`acceleration` convention.
 
 ## 100 Hz vehicle profile
 
@@ -190,14 +193,17 @@ The driver polls `sensors/core` (ERPM, motor/input current, voltage and fault da
 
 Motor and servo commands are forwarded immediately on each received ROS command. For 100 Hz command transmission, configure the upstream selector/publisher to 100 Hz, as AIMSRacer's vehicle launch does. This repeats the latest selected command; it does not increase the upstream planner's production of new commands. Core-driven wheel odometry follows the telemetry rate.
 
-The AIMSRacer vehicle extensions are retained: the driver `command_watchdog_enabled` and converter `ackermann_watchdog_enabled` default to true, with `command_timeout_sec` and `ackermann_timeout_sec` both 0.10 s. After a command stream has started, a stale stream triggers zero-speed output (`watchdog_safe_erpm` defaults to 0.0); incoming commands resume normal control. Servo traffic does not refresh the motor watchdog. Converter checks run every 10 ms and driver checks run on the telemetry tick.
+The driver command watchdog and wheel odometry variance extensions are retained
+as described above. The old converter watchdog is replaced by central source TTL
+and the driver watchdog. The native subscription checks both ROS header age and
+available DDS system publication time. The receive thread processes incoming bytes
+without the former 5 ms sleep. Motor/servo pairs keep storage alive and serialize
+all bytes, including partial writes. Already transmitted frames cannot be recalled;
+a synchronous write can still block on a stalled serial device.
 
-Wheel odometry publishes `longitudinal_velocity_variance` in `twist.covariance[0]`; the default is 0.04 (m/s)^2 and overrides must be finite and positive. Servo commands are clipped in both the converter and driver to the vehicle calibration range 0.264–0.750, with steering gain -0.5137 and offset 0.506. Current-mode startup retains the configurable 40 A default (`startup_duty_current`).
-
-Actuation subscribers use reliable `KeepLast(1)`, and the converter's motor/servo publishers use `KeepLast(1)` with a 0.10 s DDS lifespan. Both the converter and driver discard samples older than `command_max_age_sec` (default 0.10 s) before acting or refreshing their watchdogs, using DDS publication timestamps and system time rather than ROS simulated time. Set this parameter to 0 to disable the age check and publisher lifespan. Cross-host publishers need synchronized system clocks; if middleware provides no publication timestamp, the depth-one queue still applies but age cannot be checked. Frames already handed to the kernel/physical link cannot be recalled, and the synchronous serial send can still block on a stalled device.
-
-The receive thread processes incoming bytes immediately without the former 5 ms sleep. Transmits keep packet storage alive and serialize complete frames, including partial writes.
-
-With the ROS workspace built and sourced, run `python3 -m pytest -q vesc_driver/test/test_driver_link.py vesc_ackermann/test/test_vehicle_extensions.py`. This test uses a PTY VESC and an isolated ROS domain to check 50/100 Hz telemetry, 100 Hz motor/servo frames, ERPM/current decoding, fragmented replies, CRC integrity, both watchdogs, command recovery, servo limits and wheel velocity covariance without opening vehicle devices.
-
-The `interface_writes` CTest uses four concurrent callers and 2,000 temporary packets to verify frame integrity. The ROS tests additionally pause the driver/converter, age pending targets, then resume to verify expired targets are discarded and a fresh target recovers control.
+With the workspace built and sourced, run `python3 -m pytest -q
+vesc_driver/test/test_driver_link.py vesc_ackermann/test/test_vehicle_extensions.py`.
+Tests cover telemetry rates, native modes, offsets and zero stop, startup assistance,
+invalid targets, stalled DDS delivery, clock pause/rewind and wheel covariance.
+`interface_writes` uses four callers and 2000 motor/servo pairs (4000 frames) to
+check CRC integrity and adjacency without a physical device.

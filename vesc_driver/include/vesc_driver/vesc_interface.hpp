@@ -114,6 +114,9 @@ public:
    * Send a VESC packet.
    */
   void send(const VescPacket & packet);
+  // Complete motor/servo pair under the same serial write lock.
+  void sendMotorAndServo(const VescPacket & motor, const VescPacket & servo);
+
 
   void requestFWVersion();
   void requestState();
@@ -127,6 +130,7 @@ public:
   void setServo(double servo);
 
 private:
+  void sendFrames(const VescPacket & first, const VescPacket * second);
   // Pimpl - hide serial port members from class users
   class Impl;
   std::unique_ptr<Impl> impl_;
