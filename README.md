@@ -194,6 +194,10 @@ The AIMSRacer vehicle extensions are retained: the driver `command_watchdog_enab
 
 Wheel odometry publishes `longitudinal_velocity_variance` in `twist.covariance[0]`; the default is 0.04 (m/s)^2 and overrides must be finite and positive. Servo commands are clipped in both the converter and driver to the vehicle calibration range 0.264–0.750, with steering gain -0.5137 and offset 0.506. Current-mode startup retains the configurable 40 A default (`startup_duty_current`).
 
+Actuation subscribers use reliable `KeepLast(1)`, and the converter's motor/servo publishers use `KeepLast(1)` with a 0.10 s DDS lifespan. Both the converter and driver discard samples older than `command_max_age_sec` (default 0.10 s) before acting or refreshing their watchdogs, using DDS publication timestamps and system time rather than ROS simulated time. Set this parameter to 0 to disable the age check and publisher lifespan. Cross-host publishers need synchronized system clocks; if middleware provides no publication timestamp, the depth-one queue still applies but age cannot be checked. Frames already handed to the kernel/physical link cannot be recalled, and the synchronous serial send can still block on a stalled device.
+
 The receive thread processes incoming bytes immediately without the former 5 ms sleep. Transmits keep packet storage alive and serialize complete frames, including partial writes.
 
 With the ROS workspace built and sourced, run `python3 -m pytest -q vesc_driver/test/test_driver_link.py vesc_ackermann/test/test_vehicle_extensions.py`. This test uses a PTY VESC and an isolated ROS domain to check 50/100 Hz telemetry, 100 Hz motor/servo frames, ERPM/current decoding, fragmented replies, CRC integrity, both watchdogs, command recovery, servo limits and wheel velocity covariance without opening vehicle devices.
+
+The `interface_writes` CTest uses four concurrent callers and 2,000 temporary packets to verify frame integrity. The ROS tests additionally pause the driver/converter, age pending targets, then resume to verify expired targets are discarded and a fresh target recovers control.

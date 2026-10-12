@@ -105,7 +105,8 @@ def test_driver_link(tmp_path, monkeypatch, rate):
               'current_min': -80.0, 'current_max': 80.0,
               'duty_cycle_min': -1.0, 'duty_cycle_max': 1.0,
               'brake_min': 0.0, 'brake_max': 80.0,
-              'position_min': -3.14, 'position_max': 3.14}
+              'position_min': -3.14, 'position_max': 3.14,
+              'servo_min': .264, 'servo_max': .750}
     limit_args = [arg for name, value in limits.items()
                   for arg in ['-p', f'{name}:={value}']]
     with (tmp_path/'driver.log').open('w') as log:
@@ -177,8 +178,42 @@ def test_driver_link(tmp_path, monkeypatch, rate):
                 assert not any(p[0] == 8 and int.from_bytes(p[1:], 'big', signed=True) == 0
                                for t, p in emulator.packets if start_mode + .04 < t < active[-1][0]), topic
                 stop_and_check_watchdog(active[-1][0])
+            # Pause the real driver so DDS samples age while waiting to execute.
+            def spin_for(seconds):
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    executor.spin_once(timeout_sec=.005)
+
+            process.send_signal(signal.SIGSTOP)
+            spin_for(.05)
+            speed.publish(Float64(data=2222.0))
+            servo.publish(Float64(data=.6))
+            spin_for(.25)
+            resumed = time.monotonic()
+            process.send_signal(signal.SIGCONT)
+            spin_for(.20)
+            assert all(int.from_bytes(p[1:], 'big', signed=True) == 0
+                       for t, p in emulator.packets if t > resumed and p[0] == 8)
+            assert not any(p[0] == 12 for t, p in emulator.packets if t > resumed)
+
+            # A burst of old targets followed by a fresh final target must not replay the burst.
+            process.send_signal(signal.SIGSTOP)
+            spin_for(.05)
+            for target in range(3000, 3020):
+                speed.publish(Float64(data=float(target)))
+                spin_for(.002)
+            spin_for(.25)
+            speed.publish(Float64(data=8765.0))
+            spin_for(.02)
+            resumed = time.monotonic()
+            process.send_signal(signal.SIGCONT)
+            spin_for(.08)
+            targets = [int.from_bytes(p[1:], 'big', signed=True)
+                       for t, p in emulator.packets if t > resumed and p[0] == 8]
+            assert 8765 in targets and all(v in (0, 8765) for v in targets), targets
             assert not emulator.errors
         finally:
+            process.send_signal(signal.SIGCONT)
             process.send_signal(signal.SIGINT)
             try:
                 process.wait(timeout=5)

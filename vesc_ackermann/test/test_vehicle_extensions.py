@@ -111,8 +111,27 @@ def test_vehicle_extensions(tmp_path, monkeypatch, variance):
         begin = time.monotonic()
         spin_for(.05, command)
         assert any(t > begin and v == pytest.approx(40.0) for t, v in currents)
+        spin_for(.35)
+        # The converter must reject an aged Ackermann target after a process stall.
+        processes[0].send_signal(signal.SIGSTOP)
+        spin_for(.05)
+        command.drive.jerk = 0.0
+        command.drive.speed = 3.0
+        ack.publish(command)
+        spin_for(.25)
+        resumed = time.monotonic()
+        processes[0].send_signal(signal.SIGCONT)
+        spin_for(.20)
+        assert all(v == 0 for t, v in speeds if t > resumed)
+        assert not any(t > resumed for t, _ in servos)
+        command.drive.speed = 1.0
+        begin = time.monotonic()
+        spin_for(.20, command)
+        assert any(t > begin and v == pytest.approx(3465) for t, v in speeds)
+
     finally:
         for p in processes:
+            p.send_signal(signal.SIGCONT)
             p.send_signal(signal.SIGINT)
         for p in processes:
             try:

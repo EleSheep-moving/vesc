@@ -46,6 +46,7 @@ namespace vesc_ackermann
 
 using ackermann_msgs::msg::AckermannDriveStamped;
 using std::placeholders::_1;
+using std::placeholders::_2;
 using std_msgs::msg::Float64;
 
 AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
@@ -77,16 +78,26 @@ AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
   ackermann_watchdog_enabled_ = declare_parameter<bool>("ackermann_watchdog_enabled", true);
   ackermann_timeout_sec_ = declare_parameter<double>("ackermann_timeout_sec", 0.10);
 
+  command_max_age_sec_ = declare_parameter<double>("command_max_age_sec", 0.10);
+  if (!std::isfinite(command_max_age_sec_) || command_max_age_sec_ < 0.0) {
+    throw std::invalid_argument("command_max_age_sec must be finite and nonnegative");
+  }
+  auto command_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+  if (command_max_age_sec_ > 0.0) {
+    command_qos.lifespan(rclcpp::Duration::from_seconds(command_max_age_sec_));
+  }
+
   // create publishers to vesc electric-RPM (speed) and servo commands
-  erpm_pub_ = create_publisher<Float64>("commands/motor/speed", 10);
-  servo_pub_ = create_publisher<Float64>("commands/servo/position", 10);
+  erpm_pub_ = create_publisher<Float64>("commands/motor/speed", command_qos);
+  servo_pub_ = create_publisher<Float64>("commands/servo/position", command_qos);
   // create publishers for current and duty modes
-  current_pub_ = create_publisher<Float64>("commands/motor/current", 10);
-  duty_pub_ = create_publisher<Float64>("commands/motor/duty_cycle", 10);
+  current_pub_ = create_publisher<Float64>("commands/motor/current", command_qos);
+  duty_pub_ = create_publisher<Float64>("commands/motor/duty_cycle", command_qos);
 
   // subscribe to ackermann topic
   ackermann_sub_ = create_subscription<AckermannDriveStamped>(
-    "ackermann_cmd", 10, std::bind(&AckermannToVesc::ackermannCmdCallback, this, _1));
+    "ackermann_cmd", rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+    std::bind(&AckermannToVesc::ackermannCmdCallback, this, _1, _2));
   
   // subscribe to vesc state for motor speed monitoring
   vesc_state_sub_ = create_subscription<VescStateStamped>(
@@ -107,8 +118,17 @@ AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(10), std::bind(&AckermannToVesc::watchdogTimerCallback, this));
 }
 
-void AckermannToVesc::ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd)
+void AckermannToVesc::ackermannCmdCallback(
+  const AckermannDriveStamped::SharedPtr cmd, const rclcpp::MessageInfo & info)
 {
+  const auto source_stamp = info.get_rmw_message_info().source_timestamp;
+  const auto current_stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  if (command_max_age_sec_ > 0.0 && source_stamp > 0 &&
+    (current_stamp - source_stamp) * 1e-9 > command_max_age_sec_)
+  {
+    return;  // Expired inputs must neither actuate nor refresh the watchdog.
+  }
   last_ackermann_command_time_ = now();
   has_received_ackermann_command_ = true;
   ackermann_watchdog_active_ = false;

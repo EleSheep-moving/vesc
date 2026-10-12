@@ -46,6 +46,7 @@ namespace vesc_driver
 
 using namespace std::chrono_literals;
 using std::placeholders::_1;
+using std::placeholders::_2;
 using std_msgs::msg::Float64;
 using vesc_msgs::msg::VescStateStamped;
 using sensor_msgs::msg::Imu;
@@ -79,6 +80,10 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   // attempt to connect to the serial port
   command_watchdog_enabled_ = declare_parameter<bool>("command_watchdog_enabled", true);
   command_timeout_sec_ = declare_parameter<double>("command_timeout_sec", 0.10);
+  command_max_age_sec_ = declare_parameter<double>("command_max_age_sec", 0.10);
+  if (!std::isfinite(command_max_age_sec_) || command_max_age_sec_ < 0.0) {
+    throw std::invalid_argument("command_max_age_sec must be finite and nonnegative");
+  }
   watchdog_safe_erpm_ = declare_parameter<double>("watchdog_safe_erpm", 0.0);
   last_motor_command_time_ = now();
   has_received_motor_command_ = false;
@@ -102,21 +107,24 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   servo_sensor_pub_ = create_publisher<Float64>(
     "sensors/servo_position_command", rclcpp::QoS{10});
 
+  // Each actuation input retains only its newest pending sample.
+  const auto command_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+
   // subscribe to motor and servo command topics
   duty_cycle_sub_ = create_subscription<Float64>(
-    "commands/motor/duty_cycle", rclcpp::QoS{10}, std::bind(
+    "commands/motor/duty_cycle", command_qos, std::bind(
       &VescDriver::dutyCycleCallback, this,
-      _1));
+      _1, _2));
   current_sub_ = create_subscription<Float64>(
-    "commands/motor/current", rclcpp::QoS{10}, std::bind(&VescDriver::currentCallback, this, _1));
+    "commands/motor/current", command_qos, std::bind(&VescDriver::currentCallback, this, _1, _2));
   brake_sub_ = create_subscription<Float64>(
-    "commands/motor/brake", rclcpp::QoS{10}, std::bind(&VescDriver::brakeCallback, this, _1));
+    "commands/motor/brake", command_qos, std::bind(&VescDriver::brakeCallback, this, _1, _2));
   speed_sub_ = create_subscription<Float64>(
-    "commands/motor/speed", rclcpp::QoS{10}, std::bind(&VescDriver::speedCallback, this, _1));
+    "commands/motor/speed", command_qos, std::bind(&VescDriver::speedCallback, this, _1, _2));
   position_sub_ = create_subscription<Float64>(
-    "commands/motor/position", rclcpp::QoS{10}, std::bind(&VescDriver::positionCallback, this, _1));
+    "commands/motor/position", command_qos, std::bind(&VescDriver::positionCallback, this, _1, _2));
   servo_sub_ = create_subscription<Float64>(
-    "commands/servo/position", rclcpp::QoS{10}, std::bind(&VescDriver::servoCallback, this, _1));
+    "commands/servo/position", command_qos, std::bind(&VescDriver::servoCallback, this, _1, _2));
 
   // Poll core and IMU once per tick; commands are forwarded immediately on receipt.
   const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -284,6 +292,18 @@ void VescDriver::vescErrorCallback(const std::string & error)
   RCLCPP_ERROR(get_logger(), "%s", error.c_str());
 }
 
+bool VescDriver::isCommandFresh(const rclcpp::MessageInfo & info) const
+{
+  const auto source_stamp = info.get_rmw_message_info().source_timestamp;
+  if (command_max_age_sec_ <= 0.0 || source_stamp <= 0) {
+    return true;
+  }
+  // DDS publication time is system time, independent of ROS simulated time.
+  const auto current_stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  return (current_stamp - source_stamp) * 1e-9 <= command_max_age_sec_;
+}
+
 void VescDriver::markMotorCommandReceived()
 {
   last_motor_command_time_ = now();
@@ -319,8 +339,12 @@ void VescDriver::checkCommandWatchdog()
  *                   note that the VESC may impose a more restrictive bounds on the range depending
  *                   on its configuration, e.g. absolute value is between 0.05 and 0.95.
  */
-void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
+void VescDriver::dutyCycleCallback(
+  const Float64::SharedPtr duty_cycle, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setDutyCycle(duty_cycle_limit_.clip(duty_cycle->data));
@@ -332,8 +356,12 @@ void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
  *                note that the VESC may impose a more restrictive bounds on the range depending on
  *                its configuration.
  */
-void VescDriver::currentCallback(const Float64::SharedPtr current)
+void VescDriver::currentCallback(
+  const Float64::SharedPtr current, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setCurrent(current_limit_.clip(current->data));
@@ -345,8 +373,12 @@ void VescDriver::currentCallback(const Float64::SharedPtr current)
  *              However, note that the VESC may impose a more restrictive bounds on the range
  *              depending on its configuration.
  */
-void VescDriver::brakeCallback(const Float64::SharedPtr brake)
+void VescDriver::brakeCallback(
+  const Float64::SharedPtr brake, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setBrake(brake_limit_.clip(brake->data));
@@ -359,8 +391,12 @@ void VescDriver::brakeCallback(const Float64::SharedPtr brake)
  *              driver. However, note that the VESC may impose a more restrictive bounds on the
  *              range depending on its configuration.
  */
-void VescDriver::speedCallback(const Float64::SharedPtr speed)
+void VescDriver::speedCallback(
+  const Float64::SharedPtr speed, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setSpeed(speed_limit_.clip(speed->data));
@@ -371,8 +407,12 @@ void VescDriver::speedCallback(const Float64::SharedPtr speed)
  * @param position Commanded VESC motor position in radians. Any value is accepted by this driver.
  *                 Note that the VESC must be in encoder mode for this command to have an effect.
  */
-void VescDriver::positionCallback(const Float64::SharedPtr position)
+void VescDriver::positionCallback(
+  const Float64::SharedPtr position, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     // ROS uses radians but VESC seems to use degrees. Convert to degrees.
@@ -384,8 +424,12 @@ void VescDriver::positionCallback(const Float64::SharedPtr position)
 /**
  * @param servo Commanded VESC servo output position. Valid range is 0 to 1.
  */
-void VescDriver::servoCallback(const Float64::SharedPtr servo)
+void VescDriver::servoCallback(
+  const Float64::SharedPtr servo, const rclcpp::MessageInfo & info)
 {
+  if (!isCommandFresh(info)) {
+    return;
+  }
   if (driver_mode_ == MODE_OPERATING) {
     double servo_clipped(servo_limit_.clip(servo->data));
     vesc_.setServo(servo_clipped);

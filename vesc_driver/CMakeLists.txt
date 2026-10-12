@@ -45,6 +45,9 @@ ament_auto_add_executable(
 #############
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(interface_writes test/test_interface_writes.cpp TIMEOUT 30)
+  target_link_libraries(interface_writes ${PROJECT_NAME} util ${CMAKE_THREAD_LIBS_INIT})
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(driver_link test/test_driver_link.py TIMEOUT 60)
   find_package(ament_lint_auto REQUIRED)

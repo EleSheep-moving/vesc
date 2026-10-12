@@ -15,6 +15,7 @@
     telemetry_rate_hz: 100.0
     command_watchdog_enabled: true
     command_timeout_sec: 0.10
+    command_max_age_sec: 0.10
     watchdog_safe_erpm: 0.0
     ackermann_watchdog_enabled: true
     ackermann_timeout_sec: 0.10

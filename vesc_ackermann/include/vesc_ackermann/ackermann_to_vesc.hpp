@@ -59,6 +59,7 @@ private:
   double startup_timeout_ms_;  // Time window for startup confirmation (50ms default)
   bool ackermann_watchdog_enabled_;
   double ackermann_timeout_sec_;
+  double command_max_age_sec_;
 
   /** @todo consider also providing an interpolated look-up table conversion */
 
@@ -86,7 +87,8 @@ private:
   bool ackermann_watchdog_active_;
 
   // ROS callbacks
-  void ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd);
+  void ackermannCmdCallback(
+    const AckermannDriveStamped::SharedPtr cmd, const rclcpp::MessageInfo & info);
   void vescStateCallback(const VescStateStamped::SharedPtr state);
   void watchdogTimerCallback();
   void publishSafeSpeedCommand();

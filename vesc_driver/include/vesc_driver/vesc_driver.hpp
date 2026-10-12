@@ -93,6 +93,7 @@ private:
   CommandLimit servo_limit_;
   bool command_watchdog_enabled_;
   double command_timeout_sec_;
+  double command_max_age_sec_;
   double watchdog_safe_erpm_;
 
   // ROS services
@@ -126,13 +127,20 @@ private:
   bool command_watchdog_active_;
 
   // ROS callbacks
-  void brakeCallback(const Float64::SharedPtr brake);
-  void currentCallback(const Float64::SharedPtr current);
-  void dutyCycleCallback(const Float64::SharedPtr duty_cycle);
-  void positionCallback(const Float64::SharedPtr position);
-  void servoCallback(const Float64::SharedPtr servo);
-  void speedCallback(const Float64::SharedPtr speed);
+  void brakeCallback(
+    const Float64::SharedPtr brake, const rclcpp::MessageInfo & info);
+  void currentCallback(
+    const Float64::SharedPtr current, const rclcpp::MessageInfo & info);
+  void dutyCycleCallback(
+    const Float64::SharedPtr duty_cycle, const rclcpp::MessageInfo & info);
+  void positionCallback(
+    const Float64::SharedPtr position, const rclcpp::MessageInfo & info);
+  void servoCallback(
+    const Float64::SharedPtr servo, const rclcpp::MessageInfo & info);
+  void speedCallback(
+    const Float64::SharedPtr speed, const rclcpp::MessageInfo & info);
   void timerCallback();
+  bool isCommandFresh(const rclcpp::MessageInfo & info) const;
   void markMotorCommandReceived();
   void checkCommandWatchdog();
 };
