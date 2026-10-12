@@ -54,8 +54,11 @@ private:
   // conversion gain and offset
   double speed_to_erpm_gain_, speed_to_erpm_offset_;
   double steering_to_servo_gain_, steering_to_servo_offset_;
-  double startup_duty_cycle_;  // Duty cycle for motor startup (0.1)
+  double servo_min_, servo_max_;
+  double startup_duty_current_;  // Current for motor startup (0.1)
   double startup_timeout_ms_;  // Time window for startup confirmation (50ms default)
+  bool ackermann_watchdog_enabled_;
+  double ackermann_timeout_sec_;
 
   /** @todo consider also providing an interpolated look-up table conversion */
 
@@ -70,17 +73,23 @@ private:
   
   rclcpp::Subscription<AckermannDriveStamped>::SharedPtr ackermann_sub_;
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
 
   rclcpp::Time last_nonzero_speed_time_;  // When we last detected nonzero speed
+  rclcpp::Time last_ackermann_command_time_;
   double last_current_command_;  // Store last current command during startup
   double last_steering_command_;  // Store last steering command during startup
   double last_motor_speed_;  // Current motor speed from sensors
+  bool has_received_ackermann_command_;
   bool motor_has_detected_motion_;  // Flag to track if motion has been detected during startup
   bool motor_is_running_;
+  bool ackermann_watchdog_active_;
 
   // ROS callbacks
   void ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd);
   void vescStateCallback(const VescStateStamped::SharedPtr state);
+  void watchdogTimerCallback();
+  void publishSafeSpeedCommand();
 };
 
 }  // namespace vesc_ackermann

@@ -77,6 +77,13 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   }
 
   // attempt to connect to the serial port
+  command_watchdog_enabled_ = declare_parameter<bool>("command_watchdog_enabled", true);
+  command_timeout_sec_ = declare_parameter<double>("command_timeout_sec", 0.10);
+  watchdog_safe_erpm_ = declare_parameter<double>("watchdog_safe_erpm", 0.0);
+  last_motor_command_time_ = now();
+  has_received_motor_command_ = false;
+  command_watchdog_active_ = false;
+
   try {
     vesc_.connect(port, static_cast<uint32_t>(baud_rate));
   } catch (SerialException e) {
@@ -157,6 +164,7 @@ void VescDriver::timerCallback()
       driver_mode_ = MODE_OPERATING;
     }
   } else if (driver_mode_ == MODE_OPERATING) {
+    checkCommandWatchdog();
     // poll for vesc state (telemetry)
     vesc_.requestState();
     // poll for vesc imu
@@ -276,6 +284,36 @@ void VescDriver::vescErrorCallback(const std::string & error)
   RCLCPP_ERROR(get_logger(), "%s", error.c_str());
 }
 
+void VescDriver::markMotorCommandReceived()
+{
+  last_motor_command_time_ = now();
+  has_received_motor_command_ = true;
+  command_watchdog_active_ = false;
+}
+
+void VescDriver::checkCommandWatchdog()
+{
+  if (!command_watchdog_enabled_ || !has_received_motor_command_ || command_timeout_sec_ <= 0.0) {
+    return;
+  }
+
+  const double elapsed_sec = (now() - last_motor_command_time_).seconds();
+  if (elapsed_sec <= command_timeout_sec_) {
+    return;
+  }
+
+  vesc_.setSpeed(speed_limit_.clip(watchdog_safe_erpm_));
+
+  if (!command_watchdog_active_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "No motor command for %.3fs (> %.3fs); sending zero-speed watchdog command.",
+      elapsed_sec,
+      command_timeout_sec_);
+    command_watchdog_active_ = true;
+  }
+}
+
 /**
  * @param duty_cycle Commanded VESC duty cycle. Valid range for this driver is -1 to +1. However,
  *                   note that the VESC may impose a more restrictive bounds on the range depending
@@ -283,6 +321,7 @@ void VescDriver::vescErrorCallback(const std::string & error)
  */
 void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
 {
+  markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setDutyCycle(duty_cycle_limit_.clip(duty_cycle->data));
   }
@@ -295,6 +334,7 @@ void VescDriver::dutyCycleCallback(const Float64::SharedPtr duty_cycle)
  */
 void VescDriver::currentCallback(const Float64::SharedPtr current)
 {
+  markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setCurrent(current_limit_.clip(current->data));
   }
@@ -307,6 +347,7 @@ void VescDriver::currentCallback(const Float64::SharedPtr current)
  */
 void VescDriver::brakeCallback(const Float64::SharedPtr brake)
 {
+  markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setBrake(brake_limit_.clip(brake->data));
   }
@@ -320,6 +361,7 @@ void VescDriver::brakeCallback(const Float64::SharedPtr brake)
  */
 void VescDriver::speedCallback(const Float64::SharedPtr speed)
 {
+  markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     vesc_.setSpeed(speed_limit_.clip(speed->data));
   }
@@ -331,6 +373,7 @@ void VescDriver::speedCallback(const Float64::SharedPtr speed)
  */
 void VescDriver::positionCallback(const Float64::SharedPtr position)
 {
+  markMotorCommandReceived();
   if (driver_mode_ == MODE_OPERATING) {
     // ROS uses radians but VESC seems to use degrees. Convert to degrees.
     double position_deg = position_limit_.clip(position->data) * 180.0 / M_PI;

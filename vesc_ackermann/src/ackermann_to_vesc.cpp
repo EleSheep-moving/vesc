@@ -30,8 +30,11 @@
 
 #include "vesc_ackermann/ackermann_to_vesc.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
@@ -55,10 +58,24 @@ AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
     declare_parameter<double>("steering_angle_to_servo_gain");
   steering_to_servo_offset_ =
     declare_parameter<double>("steering_angle_to_servo_offset");
+  servo_min_ = declare_parameter<double>("servo_min");
+  servo_max_ = declare_parameter<double>("servo_max");
+
+  if (!std::isfinite(servo_min_) || !std::isfinite(servo_max_) ||
+    servo_min_ < 0.0 || servo_max_ > 1.0 || servo_min_ >= servo_max_)
+  {
+    throw std::invalid_argument(
+            "servo_min and servo_max must satisfy 0.0 <= servo_min < servo_max <= 1.0");
+  }
+
+  RCLCPP_INFO(
+    get_logger(), "Servo command safety range: [%.3f, %.3f]", servo_min_, servo_max_);
   
   // Motor startup parameters
-  startup_duty_cycle_ = declare_parameter<double>("startup_duty_cycle", 0.1);
+  startup_duty_current_ = declare_parameter<double>("startup_duty_current", 40.0);
   startup_timeout_ms_ = declare_parameter<double>("startup_timeout_ms", 100.0);
+  ackermann_watchdog_enabled_ = declare_parameter<bool>("ackermann_watchdog_enabled", true);
+  ackermann_timeout_sec_ = declare_parameter<double>("ackermann_timeout_sec", 0.10);
 
   // create publishers to vesc electric-RPM (speed) and servo commands
   erpm_pub_ = create_publisher<Float64>("commands/motor/speed", 10);
@@ -77,18 +94,38 @@ AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
   
   // Initialize startup state machine
   last_nonzero_speed_time_ = now();
+  last_ackermann_command_time_ = now();
   last_current_command_ = 0.0;
   last_steering_command_ = 0.0;
   last_motor_speed_ = 0.0;
+  has_received_ackermann_command_ = false;
   motor_has_detected_motion_ = false;
   motor_is_running_ = false;
+  ackermann_watchdog_active_ = false;
+
+  watchdog_timer_ = create_wall_timer(
+    std::chrono::milliseconds(10), std::bind(&AckermannToVesc::watchdogTimerCallback, this));
 }
 
 void AckermannToVesc::ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd)
 {
-  // calc steering angle (servo) - published in all modes
+  last_ackermann_command_time_ = now();
+  has_received_ackermann_command_ = true;
+  ackermann_watchdog_active_ = false;
+
+  // Convert steering angle to servo position and clip before publishing. The VESC driver
+  // independently applies the same limits as a second hardware-safety layer.
   Float64 servo_msg;
-  servo_msg.data = steering_to_servo_gain_ * cmd->drive.steering_angle + steering_to_servo_offset_;
+  const double raw_servo =
+    steering_to_servo_gain_ * cmd->drive.steering_angle + steering_to_servo_offset_;
+  servo_msg.data = std::max(servo_min_, std::min(raw_servo, servo_max_));
+
+  if (servo_msg.data != raw_servo) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Servo command %.3f exceeds mechanical range [%.3f, %.3f]; clipped to %.3f.",
+      raw_servo, servo_min_, servo_max_, servo_msg.data);
+  }
 
   // Determine control mode based on jerk field (state flag)
   // jerk = 0.0: speed mode (regular mode)
@@ -126,15 +163,11 @@ void AckermannToVesc::ackermannCmdCallback(const AckermannDriveStamped::SharedPt
       
       // State machine for motor startup
       if (!motor_is_running_) {
-        // Send startup duty cycle command
-        // Float64 duty_msg;
-        // duty_msg.data = (last_current_command_ > 0.0) ? startup_duty_cycle_ : -startup_duty_cycle_;
-        // duty_pub_->publish(duty_msg);
-        // RCLCPP_INFO(get_logger(), "Motor startup: sending duty cycle %.2f", duty_msg.data);
+
         Float64 current_msg;
-        current_msg.data = (last_current_command_ > 0.0) ? 50 : -50;
+        current_msg.data = (last_current_command_ > 0.0) ? startup_duty_current_ : -startup_duty_current_;
         current_pub_->publish(current_msg);
-        RCLCPP_INFO(get_logger(), "Motor startup: sending duty cycle %.2f", current_msg.data);
+        RCLCPP_INFO(get_logger(), "Motor startup: sending current cycle %.2f", current_msg.data);
       } 
       else if (motor_is_running_) {
         // Send current command
@@ -149,6 +182,38 @@ void AckermannToVesc::ackermannCmdCallback(const AckermannDriveStamped::SharedPt
       duty_msg.data = cmd->drive.acceleration;
       duty_pub_->publish(duty_msg);
     }
+  }
+}
+
+void AckermannToVesc::publishSafeSpeedCommand()
+{
+  Float64 erpm_msg;
+  erpm_msg.data = 0.0;
+  erpm_pub_->publish(erpm_msg);
+}
+
+void AckermannToVesc::watchdogTimerCallback()
+{
+  if (!ackermann_watchdog_enabled_ || !has_received_ackermann_command_ ||
+    ackermann_timeout_sec_ <= 0.0)
+  {
+    return;
+  }
+
+  const double elapsed_sec = (now() - last_ackermann_command_time_).seconds();
+  if (elapsed_sec <= ackermann_timeout_sec_) {
+    return;
+  }
+
+  publishSafeSpeedCommand();
+
+  if (!ackermann_watchdog_active_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "No ackermann_cmd for %.3fs (> %.3fs); publishing zero speed command.",
+      elapsed_sec,
+      ackermann_timeout_sec_);
+    ackermann_watchdog_active_ = true;
   }
 }
 

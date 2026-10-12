@@ -99,9 +99,18 @@ def test_driver_link(tmp_path, monkeypatch, rate):
     speed = node.create_publisher(Float64, '/commands/motor/speed', 10)
     servo = node.create_publisher(Float64, '/commands/servo/position', 10)
     binary = Path(get_package_prefix('vesc_driver'))/'lib/vesc_driver/vesc_driver_node'
+    # Use explicit operating limits, as the vehicle launch does. A parameterless
+    # driver otherwise clips motor targets to zero, masking watchdog recovery.
+    limits = {'speed_min': -50000.0, 'speed_max': 50000.0,
+              'current_min': -80.0, 'current_max': 80.0,
+              'duty_cycle_min': -1.0, 'duty_cycle_max': 1.0,
+              'brake_min': 0.0, 'brake_max': 80.0,
+              'position_min': -3.14, 'position_max': 3.14}
+    limit_args = [arg for name, value in limits.items()
+                  for arg in ['-p', f'{name}:={value}']]
     with (tmp_path/'driver.log').open('w') as log:
         process = subprocess.Popen([str(binary), '--ros-args', '-p', f'port:={emulator.port}',
-                                    '-p', f'telemetry_rate_hz:={rate}'],
+                                    '-p', f'telemetry_rate_hz:={rate}', *limit_args],
                                    stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 8
@@ -129,6 +138,45 @@ def test_driver_link(tmp_path, monkeypatch, rate):
                 assert rate*.90 <= hz <= rate*1.10, hz
             assert all(msg.state.speed == 12345 for _, msg in core)
             assert all(abs(msg.state.current_motor-12.34) < 1e-5 for _, msg in core)
+            assert all(int.from_bytes(p[1:], 'big', signed=True) == 4321
+                       for p in packets if p[0] == 8)
+            assert not emulator.errors
+            # Servo traffic must not keep a stale motor target alive.
+            def stop_and_check_watchdog(last_command):
+                deadline = time.monotonic() + .30
+                while time.monotonic() < deadline:
+                    servo.publish(Float64(data=.5))
+                    executor.spin_once(timeout_sec=.005)
+                zeros = [(t, p) for t, p in emulator.packets
+                         if t > last_command and p[0] == 8
+                         and int.from_bytes(p[1:], 'big', signed=True) == 0]
+                assert zeros
+                assert zeros[0][0] - last_command <= .10 + 1/rate + .05
+                assert all(int.from_bytes(p[1:], 'big', signed=True) == 0
+                           for t, p in emulator.packets if t >= zeros[0][0] and p[0] == 8)
+
+            last_speed = max(t for t, p in emulator.packets if p[0] == 8)
+            stop_and_check_watchdog(last_speed)
+            # Every supported motor mode refreshes the watchdog and can resume after a stop.
+            for topic, cmd_id, value in [('speed', 8, 4321.0), ('current', 6, 1.0),
+                                        ('duty_cycle', 5, .1), ('brake', 7, 1.0),
+                                        ('position', 9, .1)]:
+                publisher = node.create_publisher(Float64, '/commands/motor/' + topic, 10)
+                deadline = time.monotonic() + 3
+                while publisher.get_subscription_count() == 0 and time.monotonic() < deadline:
+                    executor.spin_once(timeout_sec=.01)
+                assert publisher.get_subscription_count() > 0
+                start_mode = time.monotonic()
+                while time.monotonic() < start_mode + .20:
+                    publisher.publish(Float64(data=value))
+                    executor.spin_once(timeout_sec=.01)
+                active = [(t, p) for t, p in emulator.packets
+                          if t > start_mode + .04 and p[0] == cmd_id]
+                assert active, topic
+                assert any(int.from_bytes(p[1:], 'big', signed=True) != 0 for _, p in active), topic
+                assert not any(p[0] == 8 and int.from_bytes(p[1:], 'big', signed=True) == 0
+                               for t, p in emulator.packets if start_mode + .04 < t < active[-1][0]), topic
+                stop_and_check_watchdog(active[-1][0])
             assert not emulator.errors
         finally:
             process.send_signal(signal.SIGINT)

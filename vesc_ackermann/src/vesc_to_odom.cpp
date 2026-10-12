@@ -32,6 +32,7 @@
 
 #include <cmath>
 #include <string>
+#include <stdexcept>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
@@ -62,6 +63,12 @@ namespace vesc_ackermann
 
     speed_to_erpm_gain_ = declare_parameter<double>("speed_to_erpm_gain");
     speed_to_erpm_offset_ = declare_parameter<double>("speed_to_erpm_offset");
+    longitudinal_velocity_variance_ =
+        declare_parameter<double>("longitudinal_velocity_variance", 0.04);
+    if (!std::isfinite(longitudinal_velocity_variance_) || longitudinal_velocity_variance_ <= 0.0)
+    {
+      throw std::invalid_argument("longitudinal_velocity_variance must be finite and positive");
+    }
 
     if (use_servo_cmd_)
     {
@@ -165,6 +172,7 @@ namespace vesc_ackermann
 
     // Velocity ("in the coordinate frame given by the child_frame_id")
     odom.twist.twist.linear.x = current_speed;
+    odom.twist.covariance[0] = longitudinal_velocity_variance_;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = current_angular_velocity;
 
@@ -278,6 +286,7 @@ namespace vesc_ackermann
 
     // Velocity ("in the coordinate frame given by the child_frame_id")
     odom.twist.twist.linear.x = current_speed;
+    odom.twist.covariance[0] = longitudinal_velocity_variance_;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = current_angular_velocity;
 

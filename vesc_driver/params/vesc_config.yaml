@@ -3,13 +3,18 @@
     port: "/dev/ttyVESC"
     baud_rate: 921600
     telemetry_rate_hz: 100.0
+    command_watchdog_enabled: true
+    command_timeout_sec: 0.10
+    watchdog_safe_erpm: 0.0
+    ackermann_watchdog_enabled: true
+    ackermann_timeout_sec: 0.10
     # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
     speed_to_erpm_gain: 4614.0
     speed_to_erpm_offset: 0.0
 
     # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
-    steering_angle_to_servo_gain: -1.2135
-    steering_angle_to_servo_offset: 0.5304
+    steering_angle_to_servo_gain: -0.5137
+    steering_angle_to_servo_offset: 0.506
 
     duty_cycle_min: 0.0
     duty_cycle_max: 0.0
@@ -21,5 +26,5 @@
     speed_max: 23250.0
     position_min: 0.0
     position_max: 0.0
-    servo_min: 0.15
-    servo_max: 0.85
+    servo_min: 0.264
+    servo_max: 0.75

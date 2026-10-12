@@ -5,13 +5,19 @@
     speed_to_erpm_gain: 4650.0
     speed_to_erpm_offset: 0.0
 
-    # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
-    steering_angle_to_servo_gain: -1.14
-    steering_angle_to_servo_offset: 0.444
+    # Calibrated from wheelbase=0.36m and minimum turning radius=0.70m.
+    # servo value (0 to 1) = gain * steering angle (radians) + offset
+    steering_angle_to_servo_gain: -0.5137
+    steering_angle_to_servo_offset: 0.506
 
     port: '/dev/ttyVESC'
     baud_rate: 921600
     telemetry_rate_hz: 100.0
+    command_watchdog_enabled: true
+    command_timeout_sec: 0.10
+    watchdog_safe_erpm: 0.0
+    ackermann_watchdog_enabled: true
+    ackermann_timeout_sec: 0.10
     duty_cycle_min: -0.8
     duty_cycle_max: 0.8
     current_min: -150.0
@@ -22,8 +28,8 @@
     speed_max: 23250.0
     position_min: 0.0
     position_max: 0.0
-    servo_min: 0.142
-    servo_max: 0.942
+    servo_min: 0.264
+    servo_max: 0.750
 
 # No longer needed, all parameters are shared
 # ackermann_to_vesc_node:
@@ -31,10 +37,11 @@
 
 vesc_to_odom_node:
   ros__parameters:
+    longitudinal_velocity_variance: 0.04
     odom_frame: odom
     base_frame: base_link
     # publish odom to base link tf
     publish_tf: false
     use_servo_cmd_to_calc_angular_velocity: true
-    # car wheelbase is about 25cm
-    wheelbase: .33
+    # car wheelbase is 36cm
+    wheelbase: .36

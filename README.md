@@ -190,6 +190,10 @@ The driver polls `sensors/core` (ERPM, motor/input current, voltage and fault da
 
 Motor and servo commands are forwarded immediately on each received ROS command. For 100 Hz command transmission, configure the upstream selector/publisher to 100 Hz, as AIMSRacer's vehicle launch does. This repeats the latest selected command; it does not increase the upstream planner's production of new commands. Core-driven wheel odometry follows the telemetry rate.
 
+The AIMSRacer vehicle extensions are retained: the driver `command_watchdog_enabled` and converter `ackermann_watchdog_enabled` default to true, with `command_timeout_sec` and `ackermann_timeout_sec` both 0.10 s. After a command stream has started, a stale stream triggers zero-speed output (`watchdog_safe_erpm` defaults to 0.0); incoming commands resume normal control. Servo traffic does not refresh the motor watchdog. Converter checks run every 10 ms and driver checks run on the telemetry tick.
+
+Wheel odometry publishes `longitudinal_velocity_variance` in `twist.covariance[0]`; the default is 0.04 (m/s)^2 and overrides must be finite and positive. Servo commands are clipped in both the converter and driver to the vehicle calibration range 0.264–0.750, with steering gain -0.5137 and offset 0.506. Current-mode startup retains the configurable 40 A default (`startup_duty_current`).
+
 The receive thread processes incoming bytes immediately without the former 5 ms sleep. Transmits keep packet storage alive and serialize complete frames, including partial writes.
 
-With the ROS workspace built and sourced, run `python3 -m pytest -q vesc_driver/test/test_driver_link.py`. This test uses a PTY VESC and an isolated ROS domain to check 50/100 Hz telemetry, 100 Hz motor/servo frames, ERPM/current decoding, fragmented replies and CRC integrity without opening vehicle devices.
+With the ROS workspace built and sourced, run `python3 -m pytest -q vesc_driver/test/test_driver_link.py vesc_ackermann/test/test_vehicle_extensions.py`. This test uses a PTY VESC and an isolated ROS domain to check 50/100 Hz telemetry, 100 Hz motor/servo frames, ERPM/current decoding, fragmented replies, CRC integrity, both watchdogs, command recovery, servo limits and wheel velocity covariance without opening vehicle devices.
