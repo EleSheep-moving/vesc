@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 project(vesc_driver)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set minimum C++ standard to C++14
 if(NOT "${CMAKE_CXX_STANDARD_COMPUTED_DEFAULT}")
@@ -50,6 +52,7 @@ if(BUILD_TESTING)
   target_link_libraries(interface_writes ${PROJECT_NAME} util ${CMAKE_THREAD_LIBS_INIT})
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(driver_link test/test_driver_link.py TIMEOUT 60)
+  ament_add_pytest_test(longitudinal_tracking test/test_longitudinal_tracking.py TIMEOUT 60)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()

@@ -36,10 +36,14 @@
 #include <mutex>
 #include <experimental/optional>
 #include <memory>
+#include <limits>
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include "aims_longitudinal_control/control.hpp"
 #include <std_msgs/msg/float64.hpp>
 #include <vesc_msgs/msg/vesc_command.hpp>
 #include <vesc_msgs/msg/vesc_state.hpp>
@@ -103,6 +107,28 @@ private:
   std::mutex motion_mutex_;
   std::chrono::steady_clock::time_point motion_started_{}, last_telemetry_{};
   bool motion_detected_{false};
+
+  std::string longitudinal_mode_, longitudinal_config_id_;
+  aims_longitudinal_control::Config longitudinal_config_;
+  std::unique_ptr<aims_longitudinal_control::WheelDerivative> wheel_derivative_;
+  aims_longitudinal_control::Reference reference_{};
+  vesc_msgs::msg::VescCommand reference_command_{};
+  bool tracking_active_{false}, wheel_present_{false};
+  double wheel_speed_{0.0}, wheel_stamp_{0.0}, reference_initial_age_{0.0}, last_tracking_ros_{0.0};
+  int64_t last_reference_ns_{0};
+  std::chrono::steady_clock::time_point wheel_received_{}, reference_received_{};
+  std::atomic<double> actual_avg_iq_{std::numeric_limits<double>::quiet_NaN()};
+  std::string tracking_reason_{"inactive"};
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_sub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr tracking_pub_;
+  rclcpp::TimerBase::SharedPtr tracking_timer_;
+  void wheelCallback(const nav_msgs::msg::Odometry & wheel);
+  void trackingCallback();
+  void stopTracking(const std::string & reason);
+  double startupCurrent(double current);
+  void publishTracking(const aims_longitudinal_control::ReferenceSample & sample,
+    const aims_longitudinal_control::Components & components, double after_helper, double sent,
+    const std::string & reason);
 
   // ROS services
   rclcpp::Publisher<VescStateStamped>::SharedPtr state_pub_;

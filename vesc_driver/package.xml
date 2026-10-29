@@ -24,6 +24,9 @@
   <depend>vesc_msgs</depend>
   <depend>serial_driver</depend>
   <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>aims_longitudinal_control</depend>
 
 
   <test_depend>ament_lint_auto</test_depend>

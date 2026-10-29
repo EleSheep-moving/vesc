@@ -30,6 +30,7 @@
 
 #include "vesc_driver/vesc_driver.hpp"
 #include "vesc_msgs/command_validation.hpp"
+#include "aims_longitudinal_control/parameters.hpp"
 
 #include <vesc_msgs/msg/vesc_state.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
@@ -67,6 +68,27 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   fw_version_major_(-1),
   fw_version_minor_(-1)
 {
+  rcl_interfaces::msg::ParameterDescriptor startup_only;
+  startup_only.read_only = true;
+  longitudinal_mode_ = declare_parameter<std::string>("longitudinal_mode", "speed", startup_only);
+  if (longitudinal_mode_ != "speed" && longitudinal_mode_ != "speed_acceleration") {
+    throw std::invalid_argument("longitudinal_mode must be speed or speed_acceleration");
+  }
+  longitudinal_config_ = aims_longitudinal_control::declare_parameters(*this);
+  if (longitudinal_mode_ == "speed_acceleration" &&
+    ((current_limit_.lower && *current_limit_.lower > longitudinal_config_.current_min) ||
+    (current_limit_.upper && *current_limit_.upper < longitudinal_config_.current_max)))
+  {
+    throw std::invalid_argument(
+      "Global current_min/current_max must contain longitudinal current range");
+  }
+  longitudinal_config_id_ = longitudinal_config_.identity();
+  wheel_derivative_ = std::make_unique<aims_longitudinal_control::WheelDerivative>(longitudinal_config_);
+  tracking_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/vesc/longitudinal_tracking", 10);
+  if (longitudinal_mode_ == "speed_acceleration") {
+    wheel_sub_ = create_subscription<nav_msgs::msg::Odometry>("/rear_axle/wheel_odom",
+      rclcpp::QoS(1).best_effort(), [this](const nav_msgs::msg::Odometry & wheel) {wheelCallback(wheel);});
+  }
   // get vesc serial port address
   std::string port = declare_parameter<std::string>("port", "");
   const auto baud_rate = declare_parameter<int>("baud_rate", 921600);
@@ -130,6 +152,9 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double>(1.0 / telemetry_rate));
   timer_ = create_wall_timer(period, std::bind(&VescDriver::timerCallback, this));
+  if (longitudinal_mode_ == "speed_acceleration") {
+    tracking_timer_ = create_wall_timer(10ms, std::bind(&VescDriver::trackingCallback, this));
+  }
   RCLCPP_INFO(
     get_logger(), "VESC port %s, baud %d, core/IMU polling %.1f Hz",
     port.c_str(), static_cast<int>(baud_rate), telemetry_rate);
@@ -190,6 +215,7 @@ void VescDriver::vescPacketCallback(const std::shared_ptr<VescPacket const> & pa
     state_msg.state.current_input = values->avg_input_current();
     state_msg.state.avg_id = values->avg_id();
     state_msg.state.avg_iq = values->avg_iq();
+    actual_avg_iq_ = values->avg_iq();
     state_msg.state.duty_cycle = values->duty_cycle_now();
     state_msg.state.speed = values->rpm();
 
@@ -330,7 +356,7 @@ void VescDriver::checkCommandWatchdog()
     std::chrono::steady_clock::now() - last_motor_command_time_).count();
   if (elapsed <= command_timeout_sec_) {return;}
   // Bypass calibrated offsets and configured minimums for every safe stop.
-  vesc_.setSpeed(0.0);
+  stopTracking("command_timeout");
   if (!command_watchdog_active_) {
     RCLCPP_WARN(get_logger(), "Command timeout %.3fs; sending zero ERPM, holding steering", elapsed);
     command_watchdog_active_ = true;
@@ -340,15 +366,52 @@ void VescDriver::checkCommandWatchdog()
 void VescDriver::commandCallback(
   const vesc_msgs::msg::VescCommand::SharedPtr c, const rclcpp::MessageInfo & info)
 {
-  if (driver_mode_ != MODE_OPERATING || !isCommandFresh(*c, info)) {return;}
+  if (driver_mode_ != MODE_OPERATING) {return;}
+  if (!isCommandFresh(*c, info)) {
+    if (tracking_active_) {stopTracking("stale_forwarded_command");}
+    return;
+  }
   if (!vesc_msgs::valid_command(*c) ||
     (c->control_mode == c->MODE_BRAKE_CURRENT && c->target_brake_current > *brake_limit_.upper))
   {
-    vesc_.setSpeed(0.0);
+    stopTracking("invalid_command");
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
       "Rejected invalid/disabled command; sending zero ERPM, holding steering");
     return;
   }
+  if (c->control_mode == c->MODE_ACCELERATION) {
+    if (longitudinal_mode_ != "speed_acceleration" || c->longitudinal_config_id != longitudinal_config_id_) {
+      stopTracking("tracking_disabled_or_config_mismatch");return;
+    }
+    const int64_t ref_ns = rclcpp::Time(c->reference_stamp).nanoseconds();
+    const double t = now().seconds();
+    aims_longitudinal_control::Reference incoming{c->plan_id, ref_ns * 1e-9,
+      rclcpp::Duration(c->reference_duration).seconds(),
+      rclcpp::Time(c->reference_valid_until).seconds(),c->target_speed_mps,c->target_acceleration_mps2};
+    if (!aims_longitudinal_control::valid_reference(incoming, longitudinal_config_) ||
+      !aims_longitudinal_control::reference_sample(incoming,t,longitudinal_config_).valid ||
+      ref_ns < last_reference_ns_ || (ref_ns == last_reference_ns_ && !tracking_active_)) {
+      stopTracking("invalid_expired_or_replayed_reference");return;
+    }
+    if (ref_ns == last_reference_ns_) {
+      if (c->plan_id != reference_command_.plan_id ||
+        c->reference_duration != reference_command_.reference_duration ||
+        c->reference_valid_until != reference_command_.reference_valid_until ||
+        c->target_speed_mps != reference_command_.target_speed_mps ||
+        c->target_acceleration_mps2 != reference_command_.target_acceleration_mps2) {
+        stopTracking("mutated_reference");return;
+      }
+    } else {
+      reference_received_ = std::chrono::steady_clock::now();
+      reference_initial_age_ = t - incoming.stamp;
+      last_reference_ns_ = ref_ns;
+    }
+    reference_ = incoming;reference_command_ = *c;tracking_active_ = true;
+    tracking_reason_ = "tracking";
+    markMotorCommandReceived();
+    return; // Current is sent by the independent 100 Hz feedback timer.
+  }
+  tracking_active_ = false;wheel_derivative_->reset();tracking_reason_ = "legacy_mode";
   const double servo = servo_limit_.clip(steering_gain_ * c->steering_angle + steering_offset_);
   std::unique_ptr<VescPacket> motor;
   switch (c->control_mode) {
@@ -357,17 +420,7 @@ void VescDriver::commandCallback(
         speed_limit_.clip(speed_gain_ * c->target_speed_mps + speed_offset_)));
       break;
     case vesc_msgs::msg::VescCommand::MODE_CURRENT: {
-      double current = c->target_current;
-      if (current_startup_enabled_ && std::abs(current) < 0.1) {
-        current = 0.0;
-      } else if (current_startup_enabled_) {
-        std::lock_guard<std::mutex> lock(motion_mutex_);
-        const auto t = std::chrono::steady_clock::now();
-        const bool running = motion_detected_ &&
-          std::chrono::duration<double>(t - motion_started_).count() >= startup_motion_sec_ &&
-          std::chrono::duration<double>(t - last_telemetry_).count() <= command_timeout_sec_;
-        if (!running) {current = std::copysign(startup_current_, current);}
-      }
+      const double current = startupCurrent(c->target_current);
       motor.reset(new VescPacketSetCurrent(current_limit_.clip(current)));
       break;
     }
@@ -385,6 +438,125 @@ void VescDriver::commandCallback(
   Float64 echo;
   echo.data = servo;
   servo_sensor_pub_->publish(echo);
+}
+
+double VescDriver::startupCurrent(double current)
+{
+  if (!current_startup_enabled_) {return current;}
+  if (std::abs(current) < 0.1) {return 0.0;}
+  std::lock_guard<std::mutex> lock(motion_mutex_);
+  const auto t = std::chrono::steady_clock::now();
+  const bool running = motion_detected_ &&
+    std::chrono::duration<double>(t - motion_started_).count() >= startup_motion_sec_ &&
+    std::chrono::duration<double>(t - last_telemetry_).count() <= command_timeout_sec_;
+  return running ? current : std::copysign(startup_current_, current);
+}
+
+void VescDriver::stopTracking(const std::string & reason)
+{
+  tracking_active_ = false;
+  wheel_derivative_->reset();
+  tracking_reason_ = reason;
+  // Safe stops always bypass speed offsets and configured minimums.
+  vesc_.setSpeed(0.0);
+}
+
+void VescDriver::wheelCallback(const nav_msgs::msg::Odometry & wheel)
+{
+  if (wheel.header.stamp.sec < 0 || wheel.header.stamp.nanosec >= 1000000000u ||
+    wheel.child_frame_id != "base_link" || !std::isfinite(wheel.twist.twist.linear.x)) {
+    wheel_present_ = false;wheel_derivative_->reset();return;
+  }
+  const double stamp = rclcpp::Time(wheel.header.stamp).seconds();
+  const double age = now().seconds() - stamp;
+  if (stamp <= 0.0 || age < 0.0 || age > longitudinal_config_.wheel_max_age ||
+    (wheel_stamp_ > 0.0 && stamp < wheel_stamp_)) {
+    wheel_present_ = false;wheel_derivative_->reset();return;
+  }
+  if (stamp == wheel_stamp_) {return;} // Repeated sources never renew freshness.
+  wheel_stamp_ = stamp;
+  wheel_speed_ = wheel.twist.twist.linear.x;
+  wheel_received_ = std::chrono::steady_clock::now();
+  wheel_present_ = true;
+  wheel_derivative_->observe(stamp,wheel_speed_);
+}
+
+void VescDriver::trackingCallback()
+{
+  if (driver_mode_ != MODE_OPERATING) {return;}
+  const double t = now().seconds();
+  const auto steady = std::chrono::steady_clock::now();
+  if (last_tracking_ros_ > 0.0 && t < last_tracking_ros_) {
+    wheel_present_ = false;stopTracking("ros_time_rollback");
+  }
+  last_tracking_ros_ = t;
+  aims_longitudinal_control::ReferenceSample sample;
+  aims_longitudinal_control::Components components;
+  double after_helper = 0.0, sent = 0.0;
+  if (tracking_active_) {
+    sample = aims_longitudinal_control::reference_sample(reference_, t,longitudinal_config_);
+    const double lease_age = reference_initial_age_ +
+      std::chrono::duration<double>(steady - reference_received_).count();
+    const double wheel_source_age = t - wheel_stamp_;
+    const double wheel_receipt_age = std::chrono::duration<double>(steady-wheel_received_).count();
+    if (!sample.valid || lease_age >= reference_.valid_until-reference_.stamp) {
+      stopTracking("reference_expired");
+    } else if (!wheel_present_ || wheel_source_age < 0.0 ||
+      wheel_source_age > longitudinal_config_.wheel_max_age || wheel_receipt_age < 0.0 ||
+      wheel_receipt_age > longitudinal_config_.wheel_max_age) {
+      stopTracking("wheel_stale_or_invalid");
+    } else {
+      components = aims_longitudinal_control::control(longitudinal_config_, sample,
+        wheel_speed_, wheel_derivative_->acceleration(), wheel_derivative_->valid(),
+        reference_command_.steering_angle);
+      after_helper = startupCurrent(components.current);
+      sent = longitudinal_config_.clip_current(current_limit_.clip(after_helper));
+      const double servo = servo_limit_.clip(
+        steering_gain_ * reference_command_.steering_angle + steering_offset_);
+      vesc_.sendMotorAndServo(VescPacketSetCurrent(sent), VescPacketSetServoPos(servo));
+      Float64 echo;echo.data=servo;servo_sensor_pub_->publish(echo);
+      tracking_reason_ = "tracking";
+    }
+  }
+  publishTracking(sample,components,after_helper,sent,tracking_reason_);
+}
+
+void VescDriver::publishTracking(
+  const aims_longitudinal_control::ReferenceSample & sample,
+  const aims_longitudinal_control::Components & c,double after_helper,double sent,
+  const std::string & reason)
+{
+  diagnostic_msgs::msg::DiagnosticArray array;
+  array.header.stamp = now();
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "vesc/longitudinal_tracking";status.hardware_id = "vesc";
+  status.level = tracking_active_ ? status.OK : status.WARN;
+  status.message = reason;
+  const auto add = [&status](const std::string & name,const auto & value) {
+      diagnostic_msgs::msg::KeyValue pair;pair.key=name;
+      std::ostringstream text;text.precision(17);text<<value;pair.value=text.str();
+      status.values.push_back(pair);
+    };
+  add("config_identity",longitudinal_config_id_);add("mode",longitudinal_mode_);
+  add("active",tracking_active_);add("reason",reason);add("plan_id",reference_.plan_id);
+  add("reference_stamp",reference_.stamp);add("reference_duration",reference_.duration);
+  add("reference_valid_until",reference_.valid_until);add("reference_speed",sample.speed);
+  add("reference_acceleration",sample.acceleration);add("wheel_stamp",wheel_stamp_);
+  add("wheel_source_age",now().seconds()-wheel_stamp_);
+  add("wheel_receipt_age",std::chrono::duration<double>(std::chrono::steady_clock::now()-wheel_received_).count());
+  add("wheel_speed",wheel_speed_);add("wheel_acceleration",wheel_derivative_->acceleration());
+  add("derivative_valid",wheel_derivative_->valid());add("transition_weight",c.weight);
+  add("transition_extrapolation",c.transition);add("feedforward_current",c.feedforward);
+  add("steering_compensation_enabled",longitudinal_config_.steering_compensation_enabled);
+  add("steering_angle_command",reference_command_.steering_angle);
+  add("steering_compensation_current",c.steering);
+  add("steering_compensation_limited",c.steering_limited);
+  add("proportional_current",c.proportional);add("derivative_current",c.derivative);
+  add("unclamped_current",c.unclamped);add("pre_helper_current",c.current);
+  add("post_helper_current",after_helper);add("startup_replaced",after_helper!=c.current);
+  add("sent_current",sent);add("actual_avg_iq",actual_avg_iq_.load());
+  add("saturated",c.limited || (tracking_active_ && sent!=after_helper));
+  array.status.push_back(status);tracking_pub_->publish(array);
 }
 
 VescDriver::CommandLimit::CommandLimit(
