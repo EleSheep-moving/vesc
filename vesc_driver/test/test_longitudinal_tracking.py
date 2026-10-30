@@ -15,6 +15,7 @@
 """Exercise paired tracking against a PTY only; never open vehicle hardware."""
 import os
 import math
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -57,6 +58,7 @@ def test_longitudinal_tracking(tmp_path, monkeypatch, startup, steering_compensa
                         'longitudinal.steering_compensation_enabled':str(steering_compensation).lower()}.items():
         args += ['-p', f'{name}:={value}']
     process = None
+    wire_timing = {'timestamp_kind': 'monotonic at PTY frame parse, not driver receipt or TX'}
     with (tmp_path/'driver.log').open('w') as log:
         try:
             process = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
@@ -150,10 +152,25 @@ def test_longitudinal_tracking(tmp_path, monkeypatch, startup, steering_compensa
             pump(.12)
             ref=VescCommand(); ref.header.frame_id='base_link'
             ref.control_mode=0; ref.target_speed_mps=0.; ref.target_acceleration_mps2=0.
-            start=time.monotonic(); pump(.05,new_ref=False)
-            stopped(start)
-            start=time.monotonic(); pump(.05,send=False)
-            assert not current_packets(start)
+            first_stop_packet=len(emulator.packets)
+            wire_timing['stop_requested_monotonic']=time.monotonic()
+            pump(.05,new_ref=False)
+            packets=list(emulator.packets)
+            # A prior current frame may already be in the PTY receive queue.
+            # MODE_SPEED=0 writes an atomic zero-RPM/servo pair; tracking
+            # writes current/servo, while expiry stops write zero RPM alone.
+            # Use wire order, independent of this fixture's servo clipping.
+            stop_pairs=[i for i in range(first_stop_packet,len(packets)-1)
+                        if packets[i][1]==bytes([8,0,0,0,0]) and
+                        len(packets[i+1][1])==3 and packets[i+1][1][0]==12]
+            assert stop_pairs, packets[first_stop_packet:]
+            stop_index=stop_pairs[0]
+            wire_timing['stop_ack_packet_index']=stop_index
+            wire_timing['stop_ack_rx_monotonic']=packets[stop_index][0]
+            assert not [p for _,p in packets[stop_index+1:] if p[0]==6]
+            pump(.05,send=False)
+            # Keep the same first acknowledgement across both windows.
+            assert not [p for _,p in emulator.packets[stop_index+1:] if p[0]==6]
             assert diagnostics
             values={v.key:v.value for v in diagnostics[-1].status[0].values}
             assert 'config_identity' in values and 'actual_avg_iq' in values
@@ -164,6 +181,9 @@ def test_longitudinal_tracking(tmp_path, monkeypatch, startup, steering_compensa
                 try: process.wait(timeout=5)
                 except subprocess.TimeoutExpired: process.kill(); process.wait()
             executor.shutdown(); node.destroy_node(); rclpy.shutdown(context=context); emulator.close()
+            wire_timing['packets']=[{'index':i, 'rx_monotonic':t, 'payload_hex':p.hex()}
+                                    for i,(t,p) in enumerate(emulator.packets)]
+            (tmp_path/'wire-packets.json').write_text(json.dumps(wire_timing,indent=2)+'\n')
 
 
 @pytest.mark.parametrize('mode,minimum,maximum,rejected', [
