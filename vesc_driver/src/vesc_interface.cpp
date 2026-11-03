@@ -270,6 +270,11 @@ void VescInterface::requestFWVersion()
   send(VescPacketRequestFWVersion());
 }
 
+void VescInterface::requestFastState()
+{
+  send(VescPacketRequestFastValues());
+}
+
 void VescInterface::requestState()
 {
   send(VescPacketRequestValues());

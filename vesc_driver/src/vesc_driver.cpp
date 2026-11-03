@@ -35,6 +35,7 @@
 #include <vesc_msgs/msg/vesc_state.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -83,9 +84,17 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
       "Global current_min/current_max must contain longitudinal current range");
   }
   longitudinal_config_id_ = longitudinal_config_.identity();
+  fast_loop_ = declare_parameter<bool>("fast_loop_enabled", false, startup_only);
+  fast_divider_ = declare_parameter<int>("fast_publish_divider", 10, startup_only);
+  imu_polling_ = declare_parameter<bool>("imu_polling_enabled", true, startup_only);
+  if (fast_divider_ < 1 || fast_divider_ > 100) {
+    throw std::invalid_argument("fast_publish_divider must be in [1, 100]");
+  }
+  // Speed mode closes its loop inside the VESC; it keeps the fast telemetry only.
+  fast_control_ = fast_loop_ && longitudinal_mode_ == "speed_acceleration";
   wheel_derivative_ = std::make_unique<aims_longitudinal_control::WheelDerivative>(longitudinal_config_);
   tracking_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/vesc/longitudinal_tracking", 10);
-  if (longitudinal_mode_ == "speed_acceleration") {
+  if (longitudinal_mode_ == "speed_acceleration" && !fast_control_) {
     wheel_sub_ = create_subscription<nav_msgs::msg::Odometry>("/rear_axle/wheel_odom",
       rclcpp::QoS(1).best_effort(), [this](const nav_msgs::msg::Odometry & wheel) {wheelCallback(wheel);});
   }
@@ -98,6 +107,16 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   {
     throw std::invalid_argument("baud_rate must be positive; telemetry_rate_hz must be in [1, 1000]");
   }
+  if (fast_loop_ && telemetry_rate < 100.0) {
+    throw std::invalid_argument("fast_loop_enabled needs telemetry_rate_hz of at least 100");
+  }
+  fast_period_ = 1.0 / telemetry_rate;
+  // Without the fast loop the timer polls full state and the IMU, so keep the normal rate there.
+  const double poll_rate = fast_loop_ ? telemetry_rate : std::min(telemetry_rate, 100.0);
+  if (fast_loop_ && !fast_control_) {
+    RCLCPP_INFO(get_logger(), "Fast telemetry only: longitudinal_mode %s closes its loop in the VESC", longitudinal_mode_.c_str());
+  }
+  fast_full_every_ = std::max(1, static_cast<int>(std::lround(telemetry_rate / 100.0)));
 
   // attempt to connect to the serial port
   command_watchdog_enabled_ = declare_parameter<bool>("command_watchdog_enabled", true);
@@ -150,18 +169,30 @@ VescDriver::VescDriver(const rclcpp::NodeOptions & options)
   vesc_.connect(port, static_cast<uint32_t>(baud_rate));
   // Poll core and IMU once per tick; commands are forwarded immediately on receipt.
   const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::duration<double>(1.0 / telemetry_rate));
-  timer_ = create_wall_timer(period, std::bind(&VescDriver::timerCallback, this));
-  if (longitudinal_mode_ == "speed_acceleration") {
-    tracking_timer_ = create_wall_timer(10ms, std::bind(&VescDriver::trackingCallback, this));
+    std::chrono::duration<double>(1.0 / poll_rate));
+  // The fast loop keeps this timer at 100 Hz for the mode machine, watchdog, IMU and stale stop.
+  timer_ = create_wall_timer(
+    fast_loop_ ? std::chrono::nanoseconds(10ms) : period, std::bind(&VescDriver::timerCallback, this));
+  if (fast_loop_) {
+    fast_run_ = true;
+    fast_thread_ = std::thread(&VescDriver::fastLoop, this);
+  }
+  if (longitudinal_mode_ == "speed_acceleration" && !fast_control_) {
+    tracking_timer_ = create_wall_timer(10ms, [this]() {
+        std::lock_guard<std::mutex> lock(tracking_mutex_);
+        trackingCallback();
+      });
   }
   RCLCPP_INFO(
     get_logger(), "VESC port %s, baud %d, core/IMU polling %.1f Hz",
-    port.c_str(), static_cast<int>(baud_rate), telemetry_rate);
+    port.c_str(), static_cast<int>(baud_rate), fast_loop_ ? 100.0 : poll_rate);
+  if (fast_control_) {RCLCPP_INFO(get_logger(), "Fast current loop at %.1f Hz", telemetry_rate);}
 }
 
 VescDriver::~VescDriver()
 {
+  fast_run_ = false;
+  if (fast_thread_.joinable()) {fast_thread_.join();}
   // Stop the receiver while its callbacks' members are still alive.
   vesc_.disconnect();
 }
@@ -190,11 +221,22 @@ void VescDriver::timerCallback()
       driver_mode_ = MODE_OPERATING;
     }
   } else if (driver_mode_ == MODE_OPERATING) {
-    checkCommandWatchdog();
+    {
+      std::lock_guard<std::mutex> lock(tracking_mutex_);
+      checkCommandWatchdog();
+      // No telemetry means no fast tick: stop here, or the VESC holds the last current.
+      if (fast_control_ && std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - wheel_received_).count() >
+        longitudinal_config_.wheel_max_age)
+      {
+        wheel_present_ = false;
+        trackingCallback();
+      }
+    }
     // poll for vesc state (telemetry)
-    vesc_.requestState();
+    if (!fast_loop_) {vesc_.requestState();}
     // poll for vesc imu
-    vesc_.requestImuData();
+    if (imu_polling_) {vesc_.requestImuData();}
   } else {
     // unknown mode, how did that happen?
     assert(false && "unknown driver mode");
@@ -236,22 +278,20 @@ void VescDriver::vescPacketCallback(const std::shared_ptr<VescPacket const> & pa
     state_msg.state.avg_vd = values->avg_vd();
     state_msg.state.avg_vq = values->avg_vq();
 
-    {
-      std::lock_guard<std::mutex> lock(motion_mutex_);
-      const auto received = std::chrono::steady_clock::now();
-      if (std::abs(values->rpm()) > 1.0) {
-        if (!motion_detected_ ||
-          std::chrono::duration<double>(received - last_telemetry_).count() > command_timeout_sec_)
-        {
-          motion_started_ = received;
-        }
-        motion_detected_ = true;
-      } else {
-        motion_detected_ = false;
-      }
-      last_telemetry_ = received;
+    noteMotion(values->rpm());
+    if (fast_loop_) {
+      fast_state_ = state_msg;
+      fast_state_valid_ = true;
+      fastTelemetry(values->rpm(), values->avg_iq(), values->fault_code());
+      return;
     }
     state_pub_->publish(state_msg);
+  } else if (packet->name() == "FastValues") {
+    const auto values = std::dynamic_pointer_cast<VescPacketFastValues const>(packet);
+    if (fast_loop_ && values->valid()) {
+      noteMotion(values->rpm());
+      fastTelemetry(values->rpm(), values->avg_iq(), values->fault_code());
+    }
   } else if (packet->name() == "FWVersion") {
     std::shared_ptr<VescPacketFWVersion const> fw_version =
       std::dynamic_pointer_cast<VescPacketFWVersion const>(packet);
@@ -367,6 +407,7 @@ void VescDriver::commandCallback(
   const vesc_msgs::msg::VescCommand::SharedPtr c, const rclcpp::MessageInfo & info)
 {
   if (driver_mode_ != MODE_OPERATING) {return;}
+  std::lock_guard<std::mutex> lock(tracking_mutex_);
   if (!isCommandFresh(*c, info)) {
     if (tracking_active_) {stopTracking("stale_forwarded_command");}
     return;
@@ -409,7 +450,7 @@ void VescDriver::commandCallback(
     reference_ = incoming;reference_command_ = *c;tracking_active_ = true;
     tracking_reason_ = "tracking";
     markMotorCommandReceived();
-    return; // Current is sent by the independent 100 Hz feedback timer.
+    return; // Current is sent by the feedback timer or the fast loop.
   }
   tracking_active_ = false;wheel_derivative_->reset();tracking_reason_ = "legacy_mode";
   const double servo = servo_limit_.clip(steering_gain_ * c->steering_angle + steering_offset_);
@@ -481,6 +522,77 @@ void VescDriver::wheelCallback(const nav_msgs::msg::Odometry & wheel)
   wheel_derivative_->observe(stamp,wheel_speed_);
 }
 
+void VescDriver::fastLoop()
+{
+  const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(fast_period_));
+  auto next = std::chrono::steady_clock::now();
+  int tick = 0;
+  while (fast_run_) {
+    next += period;
+    std::this_thread::sleep_until(next);
+    if (driver_mode_ == MODE_OPERATING) {
+      if (++tick >= fast_full_every_) {
+        tick = 0;
+        vesc_.requestState();
+      } else {
+        vesc_.requestFastState();
+      }
+    }
+    const auto late = std::chrono::steady_clock::now();
+    if (late - next > period) {next = late;}  // never catch up with a burst of polls
+  }
+}
+
+void VescDriver::noteMotion(double erpm)
+{
+  std::lock_guard<std::mutex> lock(motion_mutex_);
+  const auto received = std::chrono::steady_clock::now();
+  if (std::abs(erpm) > 1.0) {
+    if (!motion_detected_ ||
+      std::chrono::duration<double>(received - last_telemetry_).count() > command_timeout_sec_)
+    {
+      motion_started_ = received;
+    }
+    motion_detected_ = true;
+  } else {
+    motion_detected_ = false;
+  }
+  last_telemetry_ = received;
+}
+
+void VescDriver::fastTelemetry(double erpm, double iq, int fault)
+{
+  if (fast_control_) {fastTick(erpm);}
+  // avg_iq resets on every read: rebuild the mean. Other averages reset only on full reads.
+  fast_iq_ += iq;
+  if (++fast_samples_ < fast_divider_) {return;}
+  const double mean_iq = fast_iq_ / fast_samples_;
+  fast_iq_ = 0.0;
+  fast_samples_ = 0;
+  actual_avg_iq_ = mean_iq;
+  if (!fast_state_valid_) {return;}
+  fast_state_.header.stamp = now();
+  fast_state_.state.speed = erpm;
+  fast_state_.state.avg_iq = mean_iq;
+  fast_state_.state.fault_code = fault;
+  state_pub_->publish(fast_state_);
+}
+
+void VescDriver::fastTick(double erpm)
+{
+  std::lock_guard<std::mutex> lock(tracking_mutex_);
+  // Same conversion and dead band as vesc_to_odom, which the normal path reads through ROS.
+  double speed = (erpm + speed_offset_) / speed_gain_;
+  if (std::abs(speed) < 0.05) {speed = 0.0;}
+  wheel_stamp_ = now().seconds();
+  wheel_speed_ = speed;
+  wheel_received_ = std::chrono::steady_clock::now();
+  wheel_present_ = true;
+  wheel_derivative_->observe(wheel_stamp_, wheel_speed_);
+  trackingCallback();
+}
+
 void VescDriver::trackingCallback()
 {
   if (driver_mode_ != MODE_OPERATING) {return;}
@@ -513,12 +625,20 @@ void VescDriver::trackingCallback()
       sent = longitudinal_config_.clip_current(current_limit_.clip(after_helper));
       const double servo = servo_limit_.clip(
         steering_gain_ * reference_command_.steering_angle + steering_offset_);
-      vesc_.sendMotorAndServo(VescPacketSetCurrent(sent), VescPacketSetServoPos(servo));
-      Float64 echo;echo.data=servo;servo_sensor_pub_->publish(echo);
+      if (!fast_loop_ || servo != last_servo_ || ++fast_servo_ticks_ >= fast_full_every_) {
+        fast_servo_ticks_ = 0;last_servo_ = servo;
+        vesc_.sendMotorAndServo(VescPacketSetCurrent(sent), VescPacketSetServoPos(servo));
+        Float64 echo;echo.data=servo;servo_sensor_pub_->publish(echo);
+      } else {
+        vesc_.send(VescPacketSetCurrent(sent));
+      }
       tracking_reason_ = "tracking";
     }
   }
-  publishTracking(sample,components,after_helper,sent,tracking_reason_);
+  if (!fast_loop_ || tracking_reason_ != published_reason_ || ++fast_publish_ticks_ >= fast_full_every_) {
+    fast_publish_ticks_ = 0;published_reason_ = tracking_reason_;
+    publishTracking(sample,components,after_helper,sent,tracking_reason_);
+  }
 }
 
 void VescDriver::publishTracking(

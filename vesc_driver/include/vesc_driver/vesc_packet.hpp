@@ -180,6 +180,24 @@ class VescPacketRequestValues : public VescPacket
 public:
   VescPacketRequestValues();
 };
+
+/// Reply to COMM_GET_VALUES_SELECTIVE with FAST_VALUES_MASK: 19 bytes on the wire, one USB packet.
+class VescPacketFastValues : public VescPacket
+{
+public:
+  explicit VescPacketFastValues(std::shared_ptr<VescFrame> raw);
+
+  bool    valid() const;
+  double  avg_iq() const;
+  double  rpm() const;
+  int     fault_code() const;
+};
+
+class VescPacketRequestFastValues : public VescPacket
+{
+public:
+  VescPacketRequestFastValues();
+};
 /*------------------------------------------------------------------------------------------------*/
 
 class VescPacketSetDuty : public VescPacket

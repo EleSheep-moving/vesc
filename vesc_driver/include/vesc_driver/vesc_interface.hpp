@@ -120,6 +120,7 @@ public:
 
   void requestFWVersion();
   void requestState();
+  void requestFastState();
   void requestImuData();
 
   void setDutyCycle(double duty_cycle);

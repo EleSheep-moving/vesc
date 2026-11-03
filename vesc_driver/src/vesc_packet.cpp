@@ -413,6 +413,63 @@ VescPacketRequestValues::VescPacketRequestValues()
 
 /*------------------------------------------------------------------------------------------------*/
 
+namespace
+{
+// Firmware field bits: 5 avg_iq, 7 rpm, 15 fault. Replies keep this order after the echoed mask.
+constexpr uint32_t FAST_VALUES_MASK = (1u << 5) | (1u << 7) | (1u << 15);
+constexpr std::ptrdiff_t FAST_VALUES_SIZE = 14;
+
+int32_t read_int32(Buffer::const_iterator p)
+{
+  return static_cast<int32_t>(
+    (static_cast<uint32_t>(*p) << 24) + (static_cast<uint32_t>(*(p + 1)) << 16) +
+    (static_cast<uint32_t>(*(p + 2)) << 8) + static_cast<uint32_t>(*(p + 3)));
+}
+}  // namespace
+
+VescPacketFastValues::VescPacketFastValues(std::shared_ptr<VescFrame> raw)
+: VescPacket("FastValues", raw)
+{
+}
+
+bool VescPacketFastValues::valid() const
+{
+  return std::distance(payload_.first, payload_.second) == FAST_VALUES_SIZE &&
+         static_cast<uint32_t>(read_int32(payload_.first + 1)) == FAST_VALUES_MASK;
+}
+
+double VescPacketFastValues::avg_iq() const
+{
+  return static_cast<double>(read_int32(payload_.first + 5)) / 100.0;
+}
+
+double VescPacketFastValues::rpm() const
+{
+  return static_cast<double>(read_int32(payload_.first + 9));
+}
+
+int VescPacketFastValues::fault_code() const
+{
+  return static_cast<int>(*(payload_.first + 13));
+}
+
+REGISTER_PACKET_TYPE(COMM_GET_VALUES_SELECTIVE, VescPacketFastValues)
+
+VescPacketRequestFastValues::VescPacketRequestFastValues()
+: VescPacket("RequestFastValues", 5, COMM_GET_VALUES_SELECTIVE)
+{
+  *(payload_.first + 1) = static_cast<uint8_t>(FAST_VALUES_MASK >> 24);
+  *(payload_.first + 2) = static_cast<uint8_t>(FAST_VALUES_MASK >> 16);
+  *(payload_.first + 3) = static_cast<uint8_t>(FAST_VALUES_MASK >> 8);
+  *(payload_.first + 4) = static_cast<uint8_t>(FAST_VALUES_MASK);
+  uint16_t crc = CRC::Calculate(
+    &(*payload_.first), std::distance(payload_.first, payload_.second), VescFrame::CRC_TYPE);
+  *(frame_->end() - 3) = static_cast<uint8_t>(crc >> 8);
+  *(frame_->end() - 2) = static_cast<uint8_t>(crc & 0xFF);
+}
+
+/*------------------------------------------------------------------------------------------------*/
+
 
 VescPacketSetDuty::VescPacketSetDuty(double duty)
 : VescPacket("SetDuty", 5, COMM_SET_DUTY)

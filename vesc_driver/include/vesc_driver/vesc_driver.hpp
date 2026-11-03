@@ -38,6 +38,7 @@
 #include <memory>
 #include <limits>
 #include <string>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -118,7 +119,21 @@ private:
   int64_t last_reference_ns_{0};
   std::chrono::steady_clock::time_point wheel_received_{}, reference_received_{};
   std::atomic<double> actual_avg_iq_{std::numeric_limits<double>::quiet_NaN()};
-  std::string tracking_reason_{"inactive"};
+  std::string tracking_reason_{"inactive"}, published_reason_;
+  // Fast loop: each small telemetry reply closes the current loop directly. Full state stays
+  // near 100 Hz; /sensors/core is published every fast_publish_divider replies from both.
+  // fast_loop_: 1 kHz telemetry; fast_control_: it also closes FF+P (speed_acceleration only).
+  bool fast_loop_{false}, fast_control_{false}, imu_polling_{true}, fast_state_valid_{false};
+  int fast_divider_{10}, fast_full_every_{10}, fast_samples_{0}, fast_publish_ticks_{0}, fast_servo_ticks_{0};
+  double fast_iq_{0.0}, fast_period_{0.001}, last_servo_{std::numeric_limits<double>::quiet_NaN()};
+  VescStateStamped fast_state_{};
+  std::atomic<bool> fast_run_{false};
+  std::thread fast_thread_;
+  std::mutex tracking_mutex_;  ///< executor callbacks and the serial receive thread
+  void fastLoop();
+  void fastTick(double erpm);
+  void fastTelemetry(double erpm, double iq, int fault);
+  void noteMotion(double erpm);
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_sub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr tracking_pub_;
   rclcpp::TimerBase::SharedPtr tracking_timer_;

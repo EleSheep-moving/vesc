@@ -21,6 +21,9 @@ class VescEmulator:
         self.master, self.slave = os.openpty()
         self.port = os.ttyname(self.slave)
         self.rpm = 12345
+        self.mute_values = False
+        self.fast_iq = None
+        self.polls = 0
         self.packets = []
         self.errors = []
         self.running = True
@@ -52,12 +55,26 @@ class VescEmulator:
                 if payload[0] == 0:
                     response = b'\x00\x06\x05PTY_VESC\x00' + bytes(24)
                 elif payload[0] == 4:
+                    if self.mute_values:
+                        continue
+                    self.polls += 1
                     response = bytearray(74)
                     response[0] = 4
                     response[23:27] = struct.pack('>i', self.rpm)
                     response[5:9] = struct.pack('>i', 1234)
+                    if self.fast_iq:
+                        response[17:21] = struct.pack('>i', sum(self.fast_iq)//2)
                     response[27:29] = struct.pack('>h', 198)
                     response = bytes(response)
+                elif payload[0] == 50:
+                    if self.mute_values:
+                        continue
+                    self.polls += 1
+                    if payload[1:5] != struct.pack('>I', (1 << 5) | (1 << 7) | (1 << 15)):
+                        self.errors.append('unexpected mask')
+                        continue
+                    iq = self.fast_iq[self.polls % 2] if self.fast_iq else 0
+                    response = payload[:5] + struct.pack('>iiB', iq, self.rpm, 0)
                 elif payload[0] == 65:
                     response = bytes([65, 255, 255]) + struct.pack('>16f', *([1.0]*16))
                 else:
