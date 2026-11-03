@@ -24,7 +24,9 @@ import pytest
 from test_driver_link import VescEmulator
 
 
-def test_fast_loop(tmp_path, monkeypatch):
+@pytest.mark.parametrize('divider', [2, 10])
+def test_fast_loop(tmp_path, monkeypatch, divider):
+    """The current loop runs on every 1 kHz reply whatever fast_publish_divider thins /sensors/core to."""
     monkeypatch.setenv('ROS_DOMAIN_ID', str(180 + os.getpid() % 30))
     monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
     monkeypatch.setenv('ROS_LOG_DIR', str(tmp_path/'logs'))
@@ -53,7 +55,7 @@ def test_fast_loop(tmp_path, monkeypatch):
                         'current_max': 80., 'speed_min': -40000., 'speed_max': 40000.,
                         'current_startup_enabled': 'false', 'fast_loop_enabled': 'true',
                         'telemetry_rate_hz': 1000., 'speed_to_erpm_gain': 3465.,
-                        'imu_polling_enabled': 'false', 'fast_publish_divider': 2}.items():
+                        'imu_polling_enabled': 'false', 'fast_publish_divider': divider}.items():
         args += ['-p', f'{name}:={value}']
     process = None
     with (tmp_path/'driver.log').open('w') as log:
@@ -102,7 +104,7 @@ def test_fast_loop(tmp_path, monkeypatch):
             assert count(6) > 700, count(6)        # one current per reply
             assert count(12) < 200, count(12)      # steering stays near 100 Hz
             assert count(65) == 0                  # VESC IMU polling is off
-            assert 350 < len(core)/span < 650, len(core)/span
+            assert .7*1000/divider < len(core)/span < 1.3*1000/divider, len(core)/span
             # Iq alternates 12.34 and 32.34 A per read: consumers keep the mean, and full fields stay.
             # Every tenth read is a full packet at the mean, which shifts one sample by 10 A.
             assert sum(m.state.avg_iq for m in core)/len(core) == pytest.approx(22.34, abs=1.2)
